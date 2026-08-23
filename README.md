@@ -79,8 +79,8 @@ A Debian package can be built with `dpkg-buildpackage`.
 
 ## Troubleshooting
 
-Create `/storage/.kodi/userdata/airplay-debug` (or the equivalent under your
-Kodi profile) and restart Kodi for the daemon's full protocol logging plus
+Create a file called `debug` in this add-on's profile directory
+(`userdata/addon_data/inputstream.airplay/`) and restart Kodi for the daemon's full protocol logging plus
 per-packet accounting. It is verbose enough to swamp a log, so turn it off
 again afterwards.
 
