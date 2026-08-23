@@ -33,7 +33,18 @@ ADDON = xbmcaddon.Addon()
 ADDON_ID = ADDON.getAddonInfo('id')
 ADDON_PATH = xbmcvfs.translatePath(ADDON.getAddonInfo('path'))
 RECEIVER = os.path.join(ADDON_PATH, 'airplay-receiver')
-SOCKET = '/run/kodi-airplay.sock'
+PROFILE = xbmcvfs.translatePath(ADDON.getAddonInfo('profile'))
+
+# Kept short on purpose: a unix socket path has about a hundred characters to
+# play with, fewer on macOS than on Linux, and the profile path is already
+# most of that on some systems.
+SOCKET = os.path.join(PROFILE, 'receiver.sock')
+
+# The inputstream side runs inside Kodi rather than as a child of this script,
+# so it cannot inherit the path. Putting it in Kodi's own environment is how it
+# finds out; without this it falls back to a compiled-in default that only
+# happens to be right on the system it was built for.
+os.environ['AIRPLAY_SOCKET'] = SOCKET
 STREAM_URL = 'airplay://mirror'
 
 
@@ -163,15 +174,14 @@ def receiver_settings():
 
 def receiver_env():
     env = os.environ.copy()
-    xbmcvfs.mkdirs(xbmcvfs.translatePath(ADDON.getAddonInfo('profile')))
+    xbmcvfs.mkdirs(PROFILE)
     env['AIRPLAY_SOCKET'] = SOCKET
     env['AIRPLAY_HLS'] = '1' if hls_enabled() else '0'
     env['AIRPLAY_VOLUME'] = '1' if setting_bool('volumecontrol', True) else '0'
     env['AIRPLAY_MIRROR_AUDIO'] = '1' if setting_bool('mirroraudio', True) else '0'
     env['AIRPLAY_MIRRORING'] = '1' if setting_bool('mirroring', True) else '0'
     env['AIRPLAY_PAIRING'] = '1' if setting_bool('pairing', False) else '0'
-    env['AIRPLAY_REGISTRY'] = os.path.join(
-        xbmcvfs.translatePath(ADDON.getAddonInfo('profile')), 'paired-devices')
+    env['AIRPLAY_REGISTRY'] = os.path.join(PROFILE, 'paired-devices')
     width, height, refresh = display_mode()
     env['AIRPLAY_WIDTH'] = width
     env['AIRPLAY_HEIGHT'] = height
@@ -181,7 +191,7 @@ def receiver_env():
     # iOS AirPlay picker.
     env['AIRPLAY_NAME'] = friendly_name()
     # Touch this file and restart Kodi to get UxPlay's full RTSP-level logging.
-    if os.path.exists('/storage/.kodi/userdata/airplay-debug'):
+    if os.path.exists(os.path.join(PROFILE, 'debug')):
         env['AIRPLAY_DEBUG'] = '1'
         log('verbose receiver logging enabled')
     return env

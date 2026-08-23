@@ -26,10 +26,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#ifdef __APPLE__
+#include <net/if_dl.h>
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+/* Darwin has no MSG_NOSIGNAL; SIGPIPE is ignored at startup instead. */
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -1792,6 +1800,13 @@ static int make_listener(const char* path)
   unlink(path);
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
+  if (strlen(path) >= sizeof(addr.sun_path))
+  {
+    LOGI("socket path is too long (%zu, limit %zu): %s", strlen(path),
+         sizeof(addr.sun_path) - 1, path);
+    close(fd);
+    return -1;
+  }
   snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
 
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
@@ -1866,13 +1881,29 @@ static int get_mac(const char* iface_hint, char mac[6])
 
   for (ifa = ifaddr; ifa && !found; ifa = ifa->ifa_next)
   {
-    if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+    if (!ifa->ifa_addr)
       continue;
+#ifndef __APPLE__
+    if (ifa->ifa_addr->sa_family != AF_INET)
+      continue;
+#endif
     if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
       continue;
     if (iface_hint && *iface_hint && strcmp(ifa->ifa_name, iface_hint) != 0)
       continue;
 
+#ifdef __APPLE__
+    /* The hardware address is a link level entry of its own, listed
+     * separately from the interface's IP addresses. */
+    if (ifa->ifa_addr->sa_family != AF_LINK)
+      continue;
+    const struct sockaddr_dl* sdl = (const struct sockaddr_dl*)ifa->ifa_addr;
+    if (sdl->sdl_alen != 6)
+      continue;
+    memcpy(mac, LLADDR(sdl), 6);
+    LOGI("using interface %s", ifa->ifa_name);
+    found = 1;
+#else
     struct ifreq ifr;
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     if (s < 0)
@@ -1886,6 +1917,7 @@ static int get_mac(const char* iface_hint, char mac[6])
       found = 1;
     }
     close(s);
+#endif
   }
   freeifaddrs(ifaddr);
   return found ? 0 : -1;

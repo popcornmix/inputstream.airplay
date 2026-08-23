@@ -5,15 +5,21 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: "GCC build"
+          - name: "Linux GCC build"
+            os: ubuntu-latest
             CC: gcc
             CXX: g++
-          - name: "Clang build"
+          - name: "Linux Clang build"
+            os: ubuntu-latest
+            CC: clang
+            CXX: clang++
+          - name: "macOS build"
+            os: macos-latest
             CC: clang
             CXX: clang++
     steps:
@@ -27,10 +33,14 @@ jobs:
       uses: actions/checkout@v5
       with:
         path: ${{ env.app_id }}
-    - name: Install dependencies
+    - name: Install dependencies (Linux)
+      if: runner.os == 'Linux'
       run: |
         sudo apt-get update
         sudo apt-get install -y libssl-dev libplist-dev
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: brew install openssl@3 libplist
     - name: Prepare
       run: |
         mkdir -p ${{ github.workspace }}/xbmc/cmake/addons/addons/${app_id}
