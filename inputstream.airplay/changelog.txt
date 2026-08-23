@@ -1,3 +1,7 @@
+v0.1.1
+- Build against a Kodi without the live edge patches, and against a linker
+  that discards libm before playfair needs it.
+
 v0.1.0
 - Initial release: screen mirroring, video streamed from apps, and audio.
 - Sender volume control, PIN pairing, remote control over DACP, and elapsed
