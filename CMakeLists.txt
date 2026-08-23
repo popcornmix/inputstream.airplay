@@ -8,6 +8,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(Kodi REQUIRED)
 find_package(PkgConfig REQUIRED)
 
+# "/.." so <kodi/...> resolves; the same shape the other binary add-ons use.
+include_directories(${KODI_INCLUDE_DIR}/..
+                    ${PROJECT_SOURCE_DIR}/src)
+
 # ---------------------------------------------------------------------------
 # AirPlay protocol library
 #
