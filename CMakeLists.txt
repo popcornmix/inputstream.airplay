@@ -52,6 +52,14 @@ foreach(_part llhttp playfair mdnsd)
 endforeach()
 add_subdirectory(${uxplay_SOURCE_DIR}/lib uxplay-lib)
 
+# playfair's modified MD5 calls sin(), which upstream never declares. Passing
+# -lm further along the link line is not enough: a linker using --as-needed
+# has already discarded libm by the time the reference turns up, so say it
+# here, where it is true, and let it propagate.
+if(UNIX AND NOT APPLE)
+  target_link_libraries(playfair PUBLIC m)
+endif()
+
 # ---------------------------------------------------------------------------
 # airplay-receiver
 #
@@ -63,7 +71,7 @@ target_include_directories(airplay-receiver PRIVATE
                            ${uxplay_SOURCE_DIR}/lib
                            ${uxplay_SOURCE_DIR}/lib/mdnsd
                            ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(airplay-receiver PRIVATE airplay pthread m)  # m: playfair uses sin()
+target_link_libraries(airplay-receiver PRIVATE airplay pthread)  # libm arrives with playfair
 
 # ---------------------------------------------------------------------------
 # Kodi add-on
