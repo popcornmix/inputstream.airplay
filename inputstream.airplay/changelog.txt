@@ -1,0 +1,4 @@
+v0.1.0
+- Initial release: screen mirroring, video streamed from apps, and audio.
+- Sender volume control, PIN pairing, remote control over DACP, and elapsed
+  time and duration for streamed audio.
