@@ -13,6 +13,25 @@ include_directories(${KODI_INCLUDE_DIR}/..
                     ${PROJECT_SOURCE_DIR}/src)
 
 # ---------------------------------------------------------------------------
+# Optional Kodi features
+#
+# Starting a live stream at its live edge is not in Kodi yet. Where the running
+# Kodi's headers know about it the add-on asks for it, and where they do not it
+# simply does not, so the same source builds against either.
+# ---------------------------------------------------------------------------
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES ${KODI_INCLUDE_DIR}/..)
+check_cxx_source_compiles("
+#include <kodi/c-api/addon-instance/inputstream.h>
+int main() { return INPUTSTREAM_LOW_LATENCY_LIVE; }
+" HAVE_INPUTSTREAM_LOW_LATENCY_LIVE)
+unset(CMAKE_REQUIRED_INCLUDES)
+
+if(HAVE_INPUTSTREAM_LOW_LATENCY_LIVE)
+  add_compile_definitions(HAVE_INPUTSTREAM_LOW_LATENCY_LIVE)
+endif()
+
+# ---------------------------------------------------------------------------
 # AirPlay protocol library
 #
 # UxPlay's lib/, pinned by commit and checksum. Nothing here is patched: the

@@ -244,8 +244,10 @@ void CInputStreamAirPlay::GetCapabilities(kodi::addon::InputstreamCapabilities& 
    * start with for being closer to the sender, and that buffer is what
    * absorbs a source that stutters.
    */
+#ifdef HAVE_INPUTSTREAM_LOW_LATENCY_LIVE
   if (kodi::addon::GetSettingBoolean("lowlatency", false))
     mask |= INPUTSTREAM_LOW_LATENCY_LIVE;
+#endif
 
   capabilities.SetMask(mask);
 }
