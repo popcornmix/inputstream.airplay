@@ -40,10 +40,10 @@
 enum apx_msg_type
 {
   APX_MSG_STREAMINFO = 1, /* payload: struct apx_streaminfo            */
-  APX_MSG_VIDEO = 2,      /* payload: Annex-B access unit              */
-  APX_MSG_AUDIO = 3,      /* payload: one compressed audio frame       */
-  APX_MSG_EOS = 4,        /* no payload; session finished              */
-  APX_MSG_PROGRESS = 5,   /* payload: struct apx_progress              */
+  APX_MSG_VIDEO = 2, /* payload: Annex-B access unit              */
+  APX_MSG_AUDIO = 3, /* payload: one compressed audio frame       */
+  APX_MSG_EOS = 4, /* no payload; session finished              */
+  APX_MSG_PROGRESS = 5, /* payload: struct apx_progress              */
 };
 
 /*
@@ -93,7 +93,7 @@ struct apx_hdr
 struct apx_streaminfo
 {
   uint32_t video_codec; /* enum apx_video_codec */
-  uint32_t audio_ct;    /* enum apx_audio_ct    */
+  uint32_t audio_ct; /* enum apx_audio_ct    */
   uint32_t width;
   uint32_t height;
   uint32_t sample_rate;
@@ -112,25 +112,17 @@ struct apx_streaminfo
  * UxPlay's renderers/audio_renderer.c where they are hard-coded for the
  * GStreamer decoders. Kodi's ffmpeg wants exactly the same bytes.
  */
-#define APX_ASC_AAC_ELD                                                                            \
-  {                                                                                                \
-    0xf8, 0xe8, 0x50, 0x00                                                                         \
-  }
+#define APX_ASC_AAC_ELD {0xf8, 0xe8, 0x50, 0x00}
 #define APX_ASC_AAC_ELD_LEN 4
 
-#define APX_ASC_AAC_LC                                                                             \
-  {                                                                                                \
-    0x12, 0x10                                                                                     \
-  }
+#define APX_ASC_AAC_LC {0x12, 0x10}
 #define APX_ASC_AAC_LC_LEN 2
 
 /* 36-byte ALAC magic cookie: 44100 Hz, 16 bit, 2 channels, 352 frames/packet. */
-#define APX_ALAC_COOKIE                                                                            \
-  {                                                                                                \
-    0x00, 0x00, 0x00, 0x24, 0x61, 0x6c, 0x61, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x60, \
-        0x00, 0x10, 0x28, 0x0a, 0x0e, 0x02, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  \
-        0x00, 0x00, 0x00, 0xac, 0x44                                                               \
-  }
+#define APX_ALAC_COOKIE \
+  {0x00, 0x00, 0x00, 0x24, 0x61, 0x6c, 0x61, 0x63, 0x00, 0x00, 0x00, 0x00, \
+   0x00, 0x00, 0x01, 0x60, 0x00, 0x10, 0x28, 0x0a, 0x0e, 0x02, 0x00, 0xff, \
+   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac, 0x44}
 #define APX_ALAC_COOKIE_LEN 36
 
 #endif /* AIRPLAY_PROTO_H */

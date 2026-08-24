@@ -1,15 +1,17 @@
 Source: kodi-inputstream-airplay
-Priority: extra
+Priority: optional
 Maintainer: Dom Cobley <popcornmix@gmail.com>
-Build-Depends: debhelper-compat (= 13), cmake, libssl-dev, libplist-dev,
-               kodi-addon-dev
+Build-Depends: debhelper-compat (= 13), cmake, pkg-config, libssl-dev,
+               libplist-dev, kodi-addon-dev
 Standards-Version: 4.6.2
 Section: libs
+Homepage: https://github.com/popcornmix/inputstream.airplay
+Rules-Requires-Root: no
 
 Package: kodi-inputstream-airplay
 Section: libs
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, kodi
+Depends: ${shlibs:Depends}, ${misc:Depends}, kodi-bin | kodi
 Description: AirPlay receiver for Kodi
  Receives AirPlay screen mirroring, app video and audio, and plays them
  through Kodi's own pipeline.

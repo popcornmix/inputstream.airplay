@@ -61,6 +61,41 @@ def receiver_path():
 STREAM_URL = 'airplay://mirror'
 
 
+def read_rpc_reply(sock, want_id):
+    """Read until the reply to this request arrives, ignoring announcements.
+
+    Kodi subscribes every new JSON-RPC connection to all announcements and
+    offers no way to opt out, so what comes back can be a notification -- or
+    several -- interleaved with, or ahead of, the answer. The request that
+    causes one is the awkward case: asking the player to resume produces
+    Player.OnResume, which can arrive first.
+
+    A reply carries the request's id; a notification carries a method and no
+    id. raw_decode reads one value at a time, so both cases fall out of it, and
+    a reply split across two segments simply needs another read rather than
+    looking like malformed JSON.
+    """
+    decoder = json.JSONDecoder()
+    raw = ''
+    while len(raw) < 1024 * 1024:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        raw += chunk.decode('utf-8', 'replace')
+        while True:
+            raw = raw.lstrip()
+            if not raw:
+                break
+            try:
+                value, end = decoder.raw_decode(raw)
+            except ValueError:
+                break  # not a whole value yet; read more
+            raw = raw[end:]
+            if isinstance(value, dict) and value.get('id') == want_id:
+                return value
+    raise ValueError('no reply to id {}'.format(want_id))
+
+
 # Whether to call JSON-RPC in-process rather than over the loopback socket.
 # Decided once at startup; see use_inprocess_rpc().
 _INPROC_RPC = [False]
@@ -94,20 +129,7 @@ def kodi_rpc(method, params=None):
     try:
         with socket.create_connection(('127.0.0.1', 9090), timeout=2) as sock:
             sock.sendall(payload.encode('utf-8'))
-            # Read until it parses. One recv() is usually the whole reply, but
-            # nothing guarantees it, and a reply split across two segments
-            # would otherwise look like malformed JSON and be thrown away.
-            raw = b''
-            while len(raw) < 1024 * 1024:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                raw += chunk
-                try:
-                    return json.loads(raw.decode('utf-8', 'replace'))
-                except ValueError:
-                    continue
-            raise ValueError('incomplete reply ({} bytes)'.format(len(raw)))
+            return read_rpc_reply(sock, request['id'])
     except (OSError, ValueError) as error:
         log('json-rpc {} failed: {}'.format(method, error), xbmc.LOGDEBUG)
         return None

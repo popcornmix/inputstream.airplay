@@ -14,17 +14,18 @@
  */
 
 #include <errno.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <net/if.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #ifdef __APPLE__
 #include <net/if_dl.h>
@@ -39,15 +40,14 @@
 #define MSG_NOSIGNAL 0
 #endif
 
-#include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <netdb.h>
-
+#include "../proto.h"
 #include "dnssd.h"
 #include "raop.h"
 #include "stream.h"
 
-#include "../proto.h"
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 
 /*
  * How long to wait for room before giving up on a frame.
@@ -70,12 +70,12 @@
  * gets a longer grace period than starting one. */
 #define APX_WRITE_FINISH_MS 3000
 
-#define LOGI(...)                                                                                  \
-  do                                                                                               \
-  {                                                                                                \
-    fprintf(stderr, "[airplay-receiver] " __VA_ARGS__);                                            \
-    fprintf(stderr, "\n");                                                                         \
-    fflush(stderr);                                                                                \
+#define LOGI(...) \
+  do \
+  { \
+    fprintf(stderr, "[airplay-receiver] " __VA_ARGS__); \
+    fprintf(stderr, "\n"); \
+    fflush(stderr); \
   } while (0)
 
 /* ------------------------------------------------------------------ state */
@@ -146,7 +146,6 @@ static uint64_t g_mirror_stop_pending_ns;
  */
 static bool g_video_seen_playing;
 
-
 /*
  * How long to hold that stop before acting on it.
  *
@@ -179,7 +178,6 @@ static uint64_t g_video_start_ns;
  * first -- and the sender starts polling within about 100ms of handing over.
  */
 #define APX_VIDEO_START_GRACE_NS (10ull * 1000000000ull)
-
 
 /*
  * The session state, and g_mirror_to_video above it, are written from
@@ -270,15 +268,14 @@ static uint64_t g_last_audio_ns;
  * anything, so one that never starts can be closed again.
  */
 #define APX_AUDIO_NOSTART_NS (10ull * 1000000000ull)
-static uint64_t g_audio_session_ns;  /* when the audio format was negotiated */
+static uint64_t g_audio_session_ns; /* when the audio format was negotiated */
 static uint64_t g_audio_session_frames;
 
-
 /* diagnostics */
-static uint64_t g_frames_in;   /* handed to us by lib/ */
-static uint64_t g_frames_out;  /* forwarded to the add-on */
-static uint64_t g_audio_out;   /* audio frames forwarded */
-static uint64_t g_audio_in;    /* audio frames handed to us by lib/ */
+static uint64_t g_frames_in; /* handed to us by lib/ */
+static uint64_t g_frames_out; /* forwarded to the add-on */
+static uint64_t g_audio_out; /* audio frames forwarded */
+static uint64_t g_audio_in; /* audio frames handed to us by lib/ */
 static uint64_t g_last_video_ntp;
 /* Written by whichever thread drops a message, read by the verbose log on
  * another. Atomic because it is genuinely shared, not because the count
@@ -356,7 +353,6 @@ static uint64_t g_last_play_request_ns;
  * the Python API can attach the inputstream listitem property. Events are
  * therefore written to stdout, which the service reads from the pipe. */
 static pthread_mutex_t g_event_lock = PTHREAD_MUTEX_INITIALIZER;
-
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -494,7 +490,7 @@ static bool g_client_connected;
  */
 static uint32_t g_client_gen;
 
-static void note_dropped(void);
+static void note_dropped(const char* why);
 
 /* Caller holds g_out_lock. */
 static void out_push_locked(struct out_msg* msg)
@@ -552,8 +548,8 @@ static void reset_client_state_locked(void)
  *
  * Caller holds g_lock.
  */
-static bool send_msg_locked(uint32_t type, uint32_t flags, uint64_t pts_ns, const void* payload,
-                            uint32_t size)
+static bool send_msg_locked(
+    uint32_t type, uint32_t flags, uint64_t pts_ns, const void* payload, uint32_t size)
 {
   if (!g_client_connected)
     return false;
@@ -566,8 +562,7 @@ static bool send_msg_locked(uint32_t type, uint32_t flags, uint64_t pts_ns, cons
    */
   if (size > APX_MAX_PAYLOAD)
   {
-    LOGI("dropping a %u byte message, over the %u byte limit", size, APX_MAX_PAYLOAD);
-    note_dropped();
+    note_dropped("message over the size limit");
     return false;
   }
 
@@ -594,10 +589,8 @@ static bool send_msg_locked(uint32_t type, uint32_t flags, uint64_t pts_ns, cons
      * every frame is swallowed and the picture stops entirely. Visible
      * artefacts that heal themselves beat a freeze that does not.
      */
-    const unsigned long long dropped = ++g_dropped_msgs;
     pthread_mutex_unlock(&g_out_lock);
-    if ((dropped % 50) == 1)
-      LOGI("consumer is behind, skipped %llu messages", dropped);
+    note_dropped("consumer is behind");
     return false;
   }
 
@@ -626,14 +619,17 @@ static bool send_msg_locked(uint32_t type, uint32_t flags, uint64_t pts_ns, cons
   return true;
 }
 
-/* Count a message the consumer never got, and say so occasionally. */
-static void note_dropped(void)
+/*
+ * Count a message the consumer never got, and say so occasionally. The counter
+ * is atomic, so no lock is needed; the rate limit matters because these come
+ * from the RTP threads, where unthrottled logging stalls the pipeline it is
+ * reporting on.
+ */
+static void note_dropped(const char* why)
 {
-  pthread_mutex_lock(&g_out_lock);
   const unsigned long long dropped = ++g_dropped_msgs;
-  pthread_mutex_unlock(&g_out_lock);
   if ((dropped % 50) == 1)
-    LOGI("consumer is behind, skipped %llu messages", dropped);
+    LOGI("%s, skipped %llu messages", why, dropped);
 }
 
 /*
@@ -697,10 +693,10 @@ static void* writer_thread(void* arg)
      * repair the picture soon enough. A keyframe is never thrown away: it is
      * what the repair is made of.
      */
-    if (!msg->priming && msg->hdr.type == APX_MSG_VIDEO &&
-        !(msg->hdr.flags & APX_FLAG_KEYFRAME) && now_ns() - msg->queued_ns > APX_OUT_STALE_NS)
+    if (!msg->priming && msg->hdr.type == APX_MSG_VIDEO && !(msg->hdr.flags & APX_FLAG_KEYFRAME) &&
+        now_ns() - msg->queued_ns > APX_OUT_STALE_NS)
     {
-      note_dropped();
+      note_dropped("consumer is behind");
       free(msg);
       continue;
     }
@@ -723,7 +719,7 @@ static void* writer_thread(void* arg)
       }
       else
       {
-        note_dropped();
+        note_dropped("consumer is behind");
       }
     }
     else if (!write_all(fd, &msg->hdr, sizeof(msg->hdr)) ||
@@ -992,6 +988,68 @@ static char* base64_encode(const uint8_t* in, size_t len)
  * playback still goes through the service, which can attach list-item
  * properties and skips the VFS existence check that rejects our URLs.
  */
+/*
+ * Find the response to our request among whatever the server sent.
+ *
+ * Kodi subscribes every new JSON-RPC connection to all announcements, with no
+ * way to opt out, so a connection opened to ask one question can be sent
+ * unsolicited notifications interleaved with -- or ahead of -- its answer. The
+ * request that causes one is the worst case: Player.PlayPause produces
+ * Player.OnResume, which can arrive first.
+ *
+ * Responses carry "id", notifications carry "method" and no "id", so walking
+ * the top level objects and taking the one with our id is enough. Brace
+ * counting rather than a parser, because that is all this needs; strings are
+ * tracked so a brace inside one does not throw the count off.
+ *
+ * Returns a pointer into buf, or NULL if the response is not there yet.
+ */
+/* Every request this file sends uses the same id; there is one in flight at a
+ * time, on a connection of its own. */
+#define APX_RPC_ID "1"
+
+static char* json_find_response(char* buf, const char* id_needle)
+{
+  int depth = 0;
+  bool in_string = false, escaped = false;
+  char* start = NULL;
+
+  for (char* p = buf; *p; p++)
+  {
+    if (in_string)
+    {
+      if (escaped)
+        escaped = false;
+      else if (*p == '\\')
+        escaped = true;
+      else if (*p == '"')
+        in_string = false;
+      continue;
+    }
+    if (*p == '"')
+    {
+      in_string = true;
+    }
+    else if (*p == '{')
+    {
+      if (depth++ == 0)
+        start = p;
+    }
+    else if (*p == '}' && depth > 0 && --depth == 0 && start)
+    {
+      /* A complete top level object; is it the one we asked for? */
+      const char saved = p[1];
+      p[1] = '\0';
+      char* found = strstr(start, id_needle) ? start : NULL;
+      p[1] = saved;
+      if (found)
+        return found;
+      start = NULL;
+    }
+  }
+  return NULL;
+}
+
 static bool kodi_rpc(const char* request, char* reply, size_t reply_size)
 {
   struct sockaddr_in addr;
@@ -1012,11 +1070,24 @@ static bool kodi_rpc(const char* request, char* reply, size_t reply_size)
   if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0 &&
       send(fd, request, strlen(request), MSG_NOSIGNAL) > 0)
   {
-    ssize_t n = recv(fd, reply, reply_size - 1, 0);
-    if (n > 0)
+    /* Keep reading until our answer turns up or the socket times out; what
+     * arrives first may be an announcement rather than the response. */
+    size_t used = 0;
+    while (used + 1 < reply_size)
     {
-      reply[n] = 0;
-      ok = true;
+      ssize_t n = recv(fd, reply + used, reply_size - used - 1, 0);
+      if (n <= 0)
+        break;
+      used += (size_t)n;
+      reply[used] = 0;
+
+      char* response = json_find_response(reply, "\"id\":" APX_RPC_ID);
+      if (response)
+      {
+        memmove(reply, response, strlen(response) + 1);
+        ok = true;
+        break;
+      }
     }
   }
   close(fd);
@@ -1177,16 +1248,17 @@ static void cb_conn_init(void* cls)
  * everything derived from it, so the next session starts from scratch.
  */
 /*
- * only_if_mirroring is for the watchdog, which decides to end a mirroring
- * session and then has to drop g_lock before saying so. A video handoff can
- * arrive in that window and has already set MODE_VIDEO; tearing the session
- * down then would undo the handoff the grace period exists to allow. Checked
- * here, under the same lock the mode is set with, so there is no window left.
+ * expected is for the watchdog, which decides to end a session and then has to
+ * drop g_lock before saying so. A video handoff can arrive in that window and
+ * has already set MODE_VIDEO; tearing the session down then would undo the
+ * handoff the grace period exists to allow. Checked here, under the same lock
+ * the mode is set with, so there is no window left. MODE_IDLE means end
+ * whatever is there.
  */
-static void end_session_maybe(bool only_if_mirroring)
+static void end_session_maybe(session_mode_t expected)
 {
   pthread_mutex_lock(&g_lock);
-  if (only_if_mirroring && g_session.mode != MODE_MIRROR)
+  if (expected != MODE_IDLE && g_session.mode != expected)
   {
     pthread_mutex_unlock(&g_lock);
     return;
@@ -1225,7 +1297,7 @@ static void end_session_maybe(bool only_if_mirroring)
 
 static void end_session(void)
 {
-  end_session_maybe(false);
+  end_session_maybe(MODE_IDLE);
 }
 
 /*
@@ -1309,8 +1381,7 @@ static void cb_video_reset(void* cls, reset_type_t reset_type)
     pthread_mutex_unlock(&g_lock);
   }
 
-  if (g_hls_enabled &&
-      (reset_type == RESET_TYPE_NOHOLD || reset_type == RESET_TYPE_HLS_SHUTDOWN))
+  if (g_hls_enabled && (reset_type == RESET_TYPE_NOHOLD || reset_type == RESET_TYPE_HLS_SHUTDOWN))
   {
     raop_destroy_airplay_video(g_raop, -1);
     if (reset_type == RESET_TYPE_HLS_SHUTDOWN)
@@ -1361,8 +1432,8 @@ static int cb_video_set_codec(void* cls, video_codec_t codec)
   return 0;
 }
 
-static void cb_video_report_size(void* cls, float* width_source, float* height_source, float* width,
-                                 float* height)
+static void cb_video_report_size(
+    void* cls, float* width_source, float* height_source, float* width, float* height)
 {
   pthread_mutex_lock(&g_lock);
   /* Record the geometry but do not force a republish here: a rotation already
@@ -1374,8 +1445,12 @@ static void cb_video_report_size(void* cls, float* width_source, float* height_s
   LOGI("source %.0fx%.0f, display %.0fx%.0f", *width_source, *height_source, *width, *height);
 }
 
-static void cb_audio_get_format(void* cls, unsigned char* ct, unsigned short* spf,
-                                bool* usingScreen, bool* isMedia, uint64_t* audioFormat)
+static void cb_audio_get_format(void* cls,
+                                unsigned char* ct,
+                                unsigned short* spf,
+                                bool* usingScreen,
+                                bool* isMedia,
+                                uint64_t* audioFormat)
 {
   static const uint8_t eld[] = APX_ASC_AAC_ELD;
   static const uint8_t lc[] = APX_ASC_AAC_LC;
@@ -1482,8 +1557,8 @@ static void send_streaminfo_locked(void)
     /* Never seen: real H.264 SPS+PPS and HEVC VPS+SPS+PPS are far smaller. If
      * it ever happens the decoder gets half a parameter set, which is not
      * something anyone would work out from the symptom alone. */
-    LOGI("parameter sets are %zu bytes, only %d will fit -- the decoder may not open",
-         g_params_len, APX_MAX_VIDEO_EXTRADATA);
+    LOGI("parameter sets are %zu bytes, only %d will fit -- the decoder may not open", g_params_len,
+         APX_MAX_VIDEO_EXTRADATA);
   }
   g_info.video_extradata_size =
       (uint32_t)(g_params_len > APX_MAX_VIDEO_EXTRADATA ? APX_MAX_VIDEO_EXTRADATA : g_params_len);
@@ -1614,9 +1689,8 @@ static void cb_video_process(void* cls, raop_ntp_t* ntp, video_decode_struct* da
 
     /* Land the run just before where the newest buffered frame belongs, so
      * the live frames that follow carry on from it. */
-    const uint64_t newest = (g_gop[g_gop_count - 1].ntp > g_pts_base)
-                                ? g_gop[g_gop_count - 1].ntp - g_pts_base
-                                : span;
+    const uint64_t newest =
+        (g_gop[g_gop_count - 1].ntp > g_pts_base) ? g_gop[g_gop_count - 1].ntp - g_pts_base : span;
     const uint64_t first_pts = (newest > span) ? newest - span : 0;
 
     const bool need_params =
@@ -1791,9 +1865,8 @@ static double cb_audio_set_client_volume(void* cls)
   if (!g_volume_control)
     return 0.0; /* full: we are not going to act on changes anyway */
 
-  static const char* req =
-      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Application.GetProperties\","
-      "\"params\":{\"properties\":[\"volume\",\"muted\"]}}";
+  static const char* req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Application.GetProperties\","
+                           "\"params\":{\"properties\":[\"volume\",\"muted\"]}}";
   char reply[512];
   if (!kodi_rpc(req, reply, sizeof(reply)))
     return 0.0;
@@ -1936,7 +2009,8 @@ static void cb_audio_set_progress(void* cls, uint32_t* start, uint32_t* curr, ui
   send_msg_locked(APX_MSG_PROGRESS, 0, 0, &progress, (uint32_t)sizeof(progress));
   pthread_mutex_unlock(&g_lock);
 }
-static void cb_report_client_request(void* cls, char* deviceid, char* model, char* name, bool* admit)
+static void cb_report_client_request(
+    void* cls, char* deviceid, char* model, char* name, bool* admit)
 {
   LOGI("connection request from %s (%s)", name ? name : "?", model ? model : "?");
   *admit = true;
@@ -2067,8 +2141,7 @@ static void cb_log(void* cls, int level, const char* msg)
     suppressed = 0;
     in_window = 0;
   }
-  const bool emit =
-      in_window < (g_verbose ? APX_LOG_MAX_PER_SEC_VERBOSE : APX_LOG_MAX_PER_SEC);
+  const bool emit = in_window < (g_verbose ? APX_LOG_MAX_PER_SEC_VERBOSE : APX_LOG_MAX_PER_SEC);
   if (emit)
     in_window++;
   else
@@ -2343,8 +2416,8 @@ static int make_listener(const char* path)
   addr.sun_family = AF_UNIX;
   if (strlen(path) >= sizeof(addr.sun_path))
   {
-    LOGI("socket path is too long (%zu, limit %zu): %s", strlen(path),
-         sizeof(addr.sun_path) - 1, path);
+    LOGI("socket path is too long (%zu, limit %zu): %s", strlen(path), sizeof(addr.sun_path) - 1,
+         path);
     close(fd);
     return -1;
   }
@@ -2531,6 +2604,18 @@ static int get_mac(const char* iface_hint, char mac[6])
   return found ? 0 : -1;
 }
 
+/*
+ * Give up during startup, taking the socket with us: it exists from the moment
+ * make_listener() returns, and a later start would find it and have to work
+ * out for itself that nobody is behind it.
+ */
+static int start_failed(int listener, const char* sock_path)
+{
+  close(listener);
+  unlink(sock_path);
+  return 1;
+}
+
 int main(int argc, char** argv)
 {
   /* Read first: it decides how much the library itself logs. */
@@ -2572,21 +2657,21 @@ int main(int argc, char** argv)
   if (pthread_create(&th, NULL, accept_thread, &listener) != 0)
   {
     LOGI("could not start the accept thread");
-    goto fail;
+    return start_failed(listener, sock_path);
   }
 
   pthread_t writer;
   if (pthread_create(&writer, NULL, writer_thread, NULL) != 0)
   {
     LOGI("could not start the writer thread");
-    goto fail;
+    return start_failed(listener, sock_path);
   }
 
   char mac[6];
   if (get_mac(getenv("AIRPLAY_IFACE"), mac) != 0)
   {
     LOGI("could not determine a MAC address");
-    goto fail;
+    return start_failed(listener, sock_path);
   }
 
   int dnssd_error = 0;
@@ -2594,7 +2679,7 @@ int main(int argc, char** argv)
   if (!g_dnssd || dnssd_error)
   {
     LOGI("dnssd_init failed: %d", dnssd_error);
-    goto fail;
+    return start_failed(listener, sock_path);
   }
 
   raop_callbacks_t cbs;
@@ -2637,7 +2722,7 @@ int main(int argc, char** argv)
   if (!g_raop)
   {
     LOGI("raop_init failed");
-    goto fail;
+    return start_failed(listener, sock_path);
   }
 
   raop_set_log_callback(g_raop, cb_log, NULL);
@@ -2654,7 +2739,7 @@ int main(int argc, char** argv)
   if (raop_init2(g_raop, 1 /* nohold */, mac_str, ""))
   {
     LOGI("raop_init2 failed");
-    goto fail;
+    return start_failed(listener, sock_path);
   }
 
   /*
@@ -2814,8 +2899,8 @@ int main(int argc, char** argv)
     {
       send_keepalive_locked();
     }
-    const bool stop_now = g_mirror_stop_pending_ns &&
-                          now_ns() - g_mirror_stop_pending_ns > APX_MIRROR_STOP_GRACE_NS;
+    const bool stop_now =
+        g_mirror_stop_pending_ns && now_ns() - g_mirror_stop_pending_ns > APX_MIRROR_STOP_GRACE_NS;
     if (stop_now)
       g_mirror_stop_pending_ns = 0;
     pthread_mutex_unlock(&g_lock);
@@ -2823,7 +2908,7 @@ int main(int argc, char** argv)
     if (stop_now)
     {
       LOGI("mirroring stopped and no video followed, ending the session");
-      end_session_maybe(true);
+      end_session_maybe(MODE_MIRROR);
     }
 
     /*
@@ -2878,7 +2963,9 @@ int main(int argc, char** argv)
     {
       LOGI("audio session delivered nothing, closing it");
       pthread_mutex_unlock(&g_lock);
-      end_session();
+      /* Same shape as the mirroring teardown above: a handoff can land between
+       * the decision and this call. */
+      end_session_maybe(MODE_AUDIO);
       continue;
     }
 
@@ -2896,11 +2983,4 @@ int main(int argc, char** argv)
   close(listener);
   unlink(sock_path);
   return 0;
-
-fail:
-  /* The socket exists from here on, and a later start would find it and have
-   * to work out for itself that nobody is behind it. Take it away instead. */
-  close(listener);
-  unlink(sock_path);
-  return 1;
 }

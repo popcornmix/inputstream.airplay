@@ -85,7 +85,21 @@ Linux, macOS and FreeBSD. Not iOS, tvOS or UWP, which do not allow a process to
 be spawned, and not Android, which will not execute a binary out of the
 directory an app can write to.
 
-A Debian package can be built with `dpkg-buildpackage`.
+A Debian package can be built with `dpkg-buildpackage`, but unpack UxPlay into
+`uxplay/` first:
+
+```sh
+mkdir -p uxplay && curl -L \
+  https://github.com/FDH2/UxPlay/archive/$(sed -n 's/.*UXPLAY_VERSION "\(.*\)".*/\1/p' CMakeLists.txt).tar.gz \
+  | tar -xz --strip-components=1 -C uxplay
+dpkg-buildpackage -us -uc
+```
+
+`debian/rules` builds against that tree rather than letting cmake fetch one, and
+says so and stops if it is not there. A build chroot has no network, and a
+package headed for an archive has to carry its own sources -- so the download
+that a bare `cmake` does is not available here. Point `UXPLAY_SOURCE_DIR` at it
+if you keep it elsewhere.
 
 ## Troubleshooting
 
