@@ -1993,6 +1993,14 @@ static void cb_export_dacp(void* cls, const char* active_remote, const char* dac
  */
 #define APX_LOG_MAX_PER_SEC 200
 
+/*
+ * Verbose logging is asked for in order to see what the sender is doing, and
+ * the cap above is low enough that the library's own account of a handover --
+ * which is a burst, and the interesting part -- was being dropped before it
+ * reached the log. Someone who has turned it on wants the burst.
+ */
+#define APX_LOG_MAX_PER_SEC_VERBOSE 5000
+
 static void cb_log(void* cls, int level, const char* msg)
 {
   static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2014,7 +2022,8 @@ static void cb_log(void* cls, int level, const char* msg)
     suppressed = 0;
     in_window = 0;
   }
-  const bool emit = in_window < APX_LOG_MAX_PER_SEC;
+  const bool emit =
+      in_window < (g_verbose ? APX_LOG_MAX_PER_SEC_VERBOSE : APX_LOG_MAX_PER_SEC);
   if (emit)
     in_window++;
   else
@@ -2080,6 +2089,8 @@ static void cb_on_video_scrub(void* cls, const float position)
 
 static void cb_on_video_rate(void* cls, const float rate)
 {
+  LOGI("airplay video: sender set rate %.6f", rate);
+
   /* Only 0 (pause) and 1 (resume) are used in practice. */
   if (rate != 0.0f && rate != 1.0f)
   {
