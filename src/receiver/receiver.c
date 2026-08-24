@@ -2177,6 +2177,23 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
     return;
   }
 
+  /*
+   * No video session at all: the last one finished, or the sender is
+   * mirroring. Say so, rather than describing a video that is not there.
+   *
+   * The answer below is what a loaded, ready video looks like, and giving it
+   * when there is none leaves the sender showing that it is playing while
+   * nothing is -- and, because it believes a video is already loaded, asking
+   * it to play again only sends a resume for a video Kodi does not have.
+   */
+  if (mode != MODE_VIDEO)
+  {
+    info->position = -1.0;
+    info->duration = -1.0;
+    info->rate = 0.0f;
+    return;
+  }
+
   static unsigned poll_count;
   if (g_verbose && (poll_count++ % 30) == 0)
     LOGI("playback-info: playing=%d pos=%.1f dur=%.1f rate=%.1f", (int)playing, position, duration,
