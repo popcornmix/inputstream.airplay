@@ -2194,8 +2194,14 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
     return;
   }
 
+  /*
+   * Not gated on verbose logging. It is one line every half minute or so, and
+   * what the sender is being told about the video is the first thing worth
+   * knowing when a session misbehaves -- the alternative is asking for the
+   * whole RTSP conversation, which is thousands of lines a minute.
+   */
   static unsigned poll_count;
-  if (g_verbose && (poll_count++ % 30) == 0)
+  if ((poll_count++ % 30) == 0)
     LOGI("playback-info: playing=%d pos=%.1f dur=%.1f rate=%.1f", (int)playing, position, duration,
          rate);
 
