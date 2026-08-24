@@ -2174,13 +2174,25 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
       LOGI("airplay video: not playing yet, telling the sender we are still loading");
     }
 
+    /*
+     * Zero position and duration, because they are not known yet -- but ready
+     * and keeping up, because the alternative is not survivable. Saying the
+     * buffer is empty and we are not ready is answered by the sender pausing:
+     * every log of a cast starting paused has the pause arriving less than a
+     * tenth of a second after this reply. UxPlay, which senders are happy
+     * with, reports ready_to_play and playback_likely_to_keep_up as true
+     * unconditionally and never claims otherwise.
+     *
+     * The rate says playing: a handover is a request to play, and this is the
+     * gap before Kodi has the stream open, not a pause.
+     */
     info->position = 0.0;
     info->duration = 0.0;
-    info->rate = 0.0f;
-    info->ready_to_play = false;
-    info->playback_likely_to_keep_up = false;
-    info->playback_buffer_empty = true;
-    info->playback_buffer_full = false;
+    info->rate = 1.0f;
+    info->ready_to_play = true;
+    info->playback_likely_to_keep_up = true;
+    info->playback_buffer_empty = false;
+    info->playback_buffer_full = true;
     info->stallcount = 0;
     info->num_loaded_time_ranges = 0;
     info->num_seekable_time_ranges = 0;
