@@ -2054,6 +2054,13 @@ static void cb_on_video_play(void* cls, const char* location, const float start_
   /* This is the handoff the pending stop was waiting for. */
   g_mirror_stop_pending_ns = 0;
   g_video_seen_playing = false;
+  /*
+   * A video of its own supersedes any notice owed about the last one. The
+   * notice is set when mirroring interrupts a video, to stop the sender
+   * restarting it; left standing, the next video the sender hands over is
+   * declared finished on its first poll -- before it has played a frame.
+   */
+  g_session.notify_video_ended = false;
   session_set_mode_locked(MODE_VIDEO);
   g_video_start_ns = now_ns();
   g_session.player_open = true; /* so a later teardown still asks for a stop */
