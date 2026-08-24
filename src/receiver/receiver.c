@@ -2504,6 +2504,18 @@ int main(int argc, char** argv)
     raop_set_lang(g_raop, lang && *lang ? lang : "en", "", "");
   }
 
+  /*
+   * Accept H.265 as well as H.264 for mirroring.
+   *
+   * A sender picks the codec from what the screen it is drawing on can take,
+   * and for a 4K one it picks H.265. Without this bit it is not allowed to,
+   * so rather than fall back it sends an empty packet and gives up -- which
+   * is mirroring failing outright on any 4K display. Kodi decodes both, and
+   * everything here already handles either: VPS as well as SPS and PPS, the
+   * HEVC keyframe types, and the right filler NAL for keepalives.
+   */
+  dnssd_set_airplay_features(g_dnssd, 42, 1); /* SupportsScreenMultiCodec */
+
   if (!g_offer_mirroring)
   {
     /* Bit 7 is what a sender looks at to decide it can mirror a screen here. */
