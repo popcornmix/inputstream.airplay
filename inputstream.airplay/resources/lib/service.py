@@ -361,11 +361,25 @@ def build_item():
 
 
 def start_playback():
+    player = xbmc.Player()
+
+    # The receiver offers the stream again whenever the add-on's connection
+    # goes away, and Kodi rebuilding the player is one of the ways that
+    # happens -- so acting on every offer can restart the very player that
+    # caused it, over and over. If our stream is already the one playing, the
+    # add-on reconnects on its own and there is nothing to do here.
+    if PLAYING['url'] == STREAM_URL and player.isPlaying():
+        try:
+            if player.getPlayingFile() == STREAM_URL:
+                log('already playing this stream, ignoring the offer', xbmc.LOGDEBUG)
+                return
+        except RuntimeError:
+            pass  # it stopped between the two calls; carry on and open it
+
     log('session started, opening player')
 
     # Replacing a stream that is still running lets its teardown race the new
     # one and cancel it, so stop first and let it settle.
-    player = xbmc.Player()
     if player.isPlaying():
         player.stop()
         # Every millisecond here is a frame the sender buffers before the

@@ -133,6 +133,25 @@ static bool g_said_waiting_keyframe;
 static uint64_t g_unstartable_since_ns;
 
 /*
+ * When the mirror stream stopped without the library telling us a video
+ * handoff was coming. Zero when no stop is pending.
+ */
+static uint64_t g_mirror_stop_pending_ns;
+
+/*
+ * How long to hold that stop before acting on it.
+ *
+ * A sender switching from mirroring to streaming a video usually says so
+ * first, and that is handled directly. When it does not -- which is what a
+ * second and third attempt at the same video look like -- the stop arrives on
+ * its own and the video request follows a few hundred milliseconds later.
+ * Ending the session in that gap tears down the player Kodi is about to be
+ * asked to reuse, and the sender gives up on the video and falls back to
+ * mirroring, which is the loop this avoids.
+ */
+#define APX_MIRROR_STOP_GRACE_NS (800ull * 1000000ull)
+
+/*
  * How long to sit in that state before ending the session. Short, because
  * nothing is expected to change: the sender sends one keyframe when mirroring
  * starts and, in practice, never another.
@@ -1129,6 +1148,7 @@ static void end_session(void)
   g_meta_previous[0] = '\0';
   g_said_waiting_keyframe = false;
   g_unstartable_since_ns = 0;
+  g_mirror_stop_pending_ns = 0;
   memset(&g_info, 0, sizeof(g_info));
   g_info.sample_rate = 44100;
   g_info.channels = 2;
@@ -1171,7 +1191,14 @@ static void cb_mirror_video_running(void* cls, bool running)
     LOGI("mirroring handed over to video streaming");
     return;
   }
-  end_session();
+
+  /*
+   * Hold it briefly in case a video request is on its way; see the grace
+   * above. The watchdog ends the session if nothing arrives.
+   */
+  pthread_mutex_lock(&g_lock);
+  g_mirror_stop_pending_ns = now_ns();
+  pthread_mutex_unlock(&g_lock);
 }
 
 static void cb_conn_destroy(void* cls)
@@ -1255,8 +1282,10 @@ static int cb_video_set_codec(void* cls, video_codec_t codec)
    * straight back down. */
   if (g_session.mode == MODE_VIDEO)
     g_session.notify_video_ended = true;
-  /* A fresh mirror stream: any pending handover belonged to the last one. */
+  /* A fresh mirror stream: any pending handover belonged to the last one, and
+   * so did any stop waiting to be acted on. */
   g_mirror_to_video = false;
+  g_mirror_stop_pending_ns = 0;
   session_set_mode_locked(MODE_MIRROR);
   g_session.player_open = false;
 
@@ -1989,6 +2018,8 @@ static void cb_on_video_play(void* cls, const char* location, const float start_
   free(encoded);
 
   pthread_mutex_lock(&g_lock);
+  /* This is the handoff the pending stop was waiting for. */
+  g_mirror_stop_pending_ns = 0;
   session_set_mode_locked(MODE_VIDEO);
   g_video_start_ns = now_ns();
   g_session.player_open = true; /* so a later teardown still asks for a stop */
@@ -2620,7 +2651,17 @@ int main(int argc, char** argv)
     {
       send_keepalive_locked();
     }
+    const bool stop_now = g_mirror_stop_pending_ns &&
+                          now_ns() - g_mirror_stop_pending_ns > APX_MIRROR_STOP_GRACE_NS;
+    if (stop_now)
+      g_mirror_stop_pending_ns = 0;
     pthread_mutex_unlock(&g_lock);
+
+    if (stop_now)
+    {
+      LOGI("mirroring stopped and no video followed, ending the session");
+      end_session();
+    }
 
     /*
      * The keepalive has to be checked often, but only while there is a stream
