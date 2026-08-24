@@ -1,3 +1,10 @@
+v0.1.3
+- Works when installed from a distribution package, not just a zip.
+- The receiver socket is owner-only, and cover art no longer needs /run.
+- Verbose logging and forgetting paired devices are settings.
+- Remote control still works with Kodi's remote control service turned off.
+- Fixes a race on the session state between the receiver's threads.
+
 v0.1.2
 - macOS support.
 - The receiver socket moved from /run into the add-on's profile directory.
