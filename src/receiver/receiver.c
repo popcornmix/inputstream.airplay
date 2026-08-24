@@ -123,6 +123,9 @@ static bool g_mirror_to_video;
 /* The last track announced, so repeats of it can be ignored. */
 static char g_meta_previous[800];
 
+/* So waiting for a keyframe is said once per wait rather than once per run. */
+static bool g_said_waiting_keyframe;
+
 /*
  * When the sender handed us a video, so its first polls can be answered with
  * "still loading" rather than another stream's numbers.
@@ -886,6 +889,8 @@ static void gop_append(const uint8_t* data, size_t len, uint64_t ntp)
   if (!buf)
     return;
   memcpy(buf, data, len);
+  /* There is something to start from again. */
+  g_said_waiting_keyframe = false;
   g_gop[g_gop_count].data = buf;
   g_gop[g_gop_count].len = len;
   g_gop[g_gop_count].ntp = ntp;
@@ -1051,6 +1056,28 @@ static bool should_reoffer_locked(void)
 {
   if (g_client_connected || g_session.player_open)
     return false;
+
+  /*
+   * Only when there is something to start it with. A mirror stream can only
+   * be joined at a keyframe, and the sender decides when to send one -- there
+   * is no way to ask, the mirror channel only ever carries data one way. So
+   * opening the player before a keyframe is buffered gives Kodi a stream with
+   * nothing in it, and it sits on the buffering spinner until the sender
+   * happens to send one, which while mirroring can be minutes.
+   *
+   * Waiting instead means the screen stays where it was and mirroring comes
+   * back by itself at the next keyframe. An audio session has nothing to wait
+   * for.
+   */
+  if (g_session.mode != MODE_AUDIO && !g_gop_count)
+  {
+    if (!g_said_waiting_keyframe)
+    {
+      g_said_waiting_keyframe = true;
+      LOGI("nothing to start playback from yet, waiting for the sender's next keyframe");
+    }
+    return false;
+  }
 
   uint64_t now = now_ns();
   if (g_last_play_request_ns && now - g_last_play_request_ns < 2000000000ull)
