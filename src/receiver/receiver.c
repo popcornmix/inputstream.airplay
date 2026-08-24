@@ -127,6 +127,19 @@ static char g_meta_previous[800];
 static bool g_said_waiting_keyframe;
 
 /*
+ * When mirroring was left with no way to start a player: no client attached
+ * and no keyframe buffered to start one from. Zero when that is not the case.
+ */
+static uint64_t g_unstartable_since_ns;
+
+/*
+ * How long to sit in that state before ending the session. Short, because
+ * nothing is expected to change: the sender sends one keyframe when mirroring
+ * starts and, in practice, never another.
+ */
+#define APX_UNSTARTABLE_GRACE_NS (3ull * 1000000000ull)
+
+/*
  * When the sender handed us a video, so its first polls can be answered with
  * "still loading" rather than another stream's numbers.
  */
@@ -891,6 +904,7 @@ static void gop_append(const uint8_t* data, size_t len, uint64_t ntp)
   memcpy(buf, data, len);
   /* There is something to start from again. */
   g_said_waiting_keyframe = false;
+  g_unstartable_since_ns = 0;
   g_gop[g_gop_count].data = buf;
   g_gop[g_gop_count].len = len;
   g_gop[g_gop_count].ntp = ntp;
@@ -1074,7 +1088,8 @@ static bool should_reoffer_locked(void)
     if (!g_said_waiting_keyframe)
     {
       g_said_waiting_keyframe = true;
-      LOGI("nothing to start playback from yet, waiting for the sender's next keyframe");
+      g_unstartable_since_ns = now_ns();
+      LOGI("nothing to start playback from yet");
     }
     return false;
   }
@@ -1112,6 +1127,8 @@ static void end_session(void)
   session_set_mode_locked(MODE_IDLE);
   g_session.notify_video_ended = false;
   g_meta_previous[0] = '\0';
+  g_said_waiting_keyframe = false;
+  g_unstartable_since_ns = 0;
   memset(&g_info, 0, sizeof(g_info));
   g_info.sample_rate = 44100;
   g_info.channels = 2;
@@ -2625,6 +2642,31 @@ int main(int argc, char** argv)
      * just picked us. Close it rather than leave Kodi running a clock over an
      * empty stream; the sender pressing play offers it again.
      */
+    /*
+     * Mirroring that cannot be started again. A stream can only be joined at
+     * a keyframe, and the sender sends one when mirroring starts and then, in
+     * practice, never another -- thousands of frames later there is still
+     * only the first. So once the buffered run has been dropped and the
+     * player has gone, which is what stopping playback locally does, there is
+     * no way back into the stream and waiting achieves nothing.
+     *
+     * Dropping the sender's connections ends the session, which at least
+     * leaves the phone agreeing that it is no longer mirroring -- rather than
+     * showing that it is while nothing arrives. Starting it again from the
+     * phone gets a fresh keyframe and works.
+     */
+    const bool unstartable = g_session.mode == MODE_MIRROR && !g_client_connected &&
+                             !g_session.player_open && g_unstartable_since_ns &&
+                             now_ns() - g_unstartable_since_ns > APX_UNSTARTABLE_GRACE_NS;
+    if (unstartable)
+    {
+      g_unstartable_since_ns = 0;
+      pthread_mutex_unlock(&g_lock);
+      LOGI("mirroring cannot be rejoined without a keyframe, ending the session");
+      raop_remove_known_connections(g_raop);
+      continue;
+    }
+
     const bool never_started = g_session.mode == MODE_AUDIO && g_session.player_open &&
                                !g_audio_session_frames && g_audio_session_ns &&
                                now_ns() - g_audio_session_ns > APX_AUDIO_NOSTART_NS;
