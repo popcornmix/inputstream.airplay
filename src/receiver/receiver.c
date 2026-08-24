@@ -162,7 +162,6 @@ static void session_set_mode_locked(session_mode_t mode)
 }
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_client = -1; /* connected inputstream addon, -1 if none */
 static bool g_sent_streaminfo;
 static bool g_sent_params; /* parameter sets pushed to this client yet? */
 
@@ -237,7 +236,7 @@ static uint64_t g_frames_out;  /* forwarded to the add-on */
 static uint64_t g_audio_out;   /* audio frames forwarded */
 static uint64_t g_audio_in;    /* audio frames handed to us by lib/ */
 static uint64_t g_last_video_ntp;
-static uint64_t g_dropped_msgs;
+static uint64_t g_dropped_msgs; /* guarded by g_out_lock */
 
 /* A session is either screen mirroring or plain audio streaming. The sender
  * tells us which via usingScreen on the audio SETUP. Audio-only sessions have
@@ -336,11 +335,12 @@ static uint64_t now_ns(void)
 }
 
 /*
- * Write everything or fail. Caller holds g_lock.
+ * Write everything or fail.
  *
- * These calls run on UxPlay's mirror thread, so blocking here would stop us
- * reading from the phone and the sender would throttle itself to match Kodi's
- * consumption. Wait only briefly for room; the caller drops the frame instead.
+ * Both of these block, which is why they run on the writer thread and nowhere
+ * else. Wait only briefly for room; the caller drops the message instead,
+ * because for a live mirror a frame that arrives late is worth less than the
+ * one behind it.
  */
 static bool wait_writable(int fd, int timeout_ms)
 {
@@ -377,56 +377,156 @@ static bool write_all(int fd, const void* buf, size_t len)
   return true;
 }
 
-static void drop_client_locked(void)
+/*
+ * Everything the client is sent goes through one writer thread.
+ *
+ * Every message is produced on a thread UxPlay wants back promptly: the
+ * mirror thread reading from the phone, the RTP thread, and the httpd thread
+ * answering a sender that has its own timeouts. Writing from those threads
+ * meant waiting for a busy Kodi while holding g_lock, so one slow consumer
+ * stalled volume, progress and format negotiation along with the picture.
+ * Now a slow consumer only backs up this queue.
+ *
+ * The socket has a single owner. Only the writer thread closes it, and a new
+ * client arrives as an item in the queue rather than through a second lock --
+ * otherwise a drop on one thread could close the descriptor another was in
+ * the middle of send()ing to, and the fd number would already have been
+ * handed to something else by the time it noticed.
+ */
+enum out_kind
 {
-  if (g_client >= 0)
-  {
-    LOGI("client disconnected");
-    close(g_client);
-    g_client = -1;
-    g_sent_streaminfo = false;
-    g_sent_params = false;
-    g_primed = false;
-    g_video_started = false;
-    /* Kodi may simply have been stopped while the sender keeps streaming, so
-     * allow playback to be offered again rather than latching it off for the
-     * rest of the session. */
-    g_session.player_open = false;
-  }
+  OUT_MESSAGE,
+  OUT_NEW_CLIENT,
+};
+
+struct out_msg
+{
+  struct out_msg* next;
+  enum out_kind kind;
+  int fd; /* OUT_NEW_CLIENT only */
+  uint32_t gen; /* OUT_NEW_CLIENT only */
+  uint64_t queued_ns;
+  bool priming;
+  struct apx_hdr hdr;
+  uint32_t size;
+  uint8_t payload[];
+};
+
+/*
+ * How much may be waiting. The live limit is small on purpose: it is what
+ * bounds how far behind the live edge a struggling consumer can put us, and
+ * it takes over the job the old per-message write timeout did. Priming is
+ * allowed the whole queue, because a run replayed with a hole in it is worse
+ * than useless -- the frames after the hole reference what was lost.
+ */
+#define APX_OUT_LIVE_MAX_MSGS 24
+#define APX_OUT_LIVE_MAX_BYTES (2 * 1024 * 1024)
+#define APX_OUT_MAX_MSGS (APX_GOP_MAX_FRAMES + 32)
+#define APX_OUT_MAX_BYTES (APX_GOP_MAX_BYTES + APX_OUT_LIVE_MAX_BYTES)
+
+/*
+ * A live video frame the writer only reaches this long after it was produced
+ * is thrown away rather than written. Once a stall clears, what is queued is
+ * history: showing it puts the session permanently that far behind, and the
+ * next frames repair the picture anyway.
+ */
+#define APX_OUT_STALE_NS (200ull * 1000000ull)
+
+static pthread_mutex_t g_out_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_out_cv = PTHREAD_COND_INITIALIZER;
+static struct out_msg* g_out_head;
+static struct out_msg* g_out_tail;
+static size_t g_out_count;
+static size_t g_out_bytes;
+
+/* Whether a client is attached, for the callbacks that only need to know
+ * that much. The descriptor itself belongs to the writer thread. */
+static bool g_client_connected;
+
+/*
+ * Bumped for every client. The writer carries the generation of the socket it
+ * is writing to, so a failure on one that has already been replaced cannot
+ * disown its replacement.
+ */
+static uint32_t g_client_gen;
+
+/* Caller holds g_out_lock. */
+static void out_push_locked(struct out_msg* msg)
+{
+  msg->next = NULL;
+  if (g_out_tail)
+    g_out_tail->next = msg;
+  else
+    g_out_head = msg;
+  g_out_tail = msg;
+  g_out_count++;
+  g_out_bytes += msg->size;
+  pthread_cond_signal(&g_out_cv);
 }
 
+/* Caller holds g_out_lock. */
+static void out_clear_locked(void)
+{
+  struct out_msg* msg = g_out_head;
+  while (msg)
+  {
+    struct out_msg* next = msg->next;
+    if (msg->kind == OUT_NEW_CLIENT && msg->fd >= 0)
+      close(msg->fd);
+    free(msg);
+    msg = next;
+  }
+  g_out_head = g_out_tail = NULL;
+  g_out_count = 0;
+  g_out_bytes = 0;
+}
+
+/*
+ * Forget everything derived from the client that just went away. The
+ * descriptor is not touched here; the writer thread owns it.
+ *
+ * Caller holds g_lock.
+ */
+static void reset_client_state_locked(void)
+{
+  g_client_connected = false;
+  g_sent_streaminfo = false;
+  g_sent_params = false;
+  g_primed = false;
+  g_video_started = false;
+  /* Kodi may simply have been stopped while the sender keeps streaming, so
+   * allow playback to be offered again rather than latching it off for the
+   * rest of the session. */
+  g_session.player_open = false;
+}
+
+/*
+ * Hand a message to the writer. Returns false if there is nobody to send it
+ * to, or if the queue is too full to take it.
+ *
+ * Caller holds g_lock.
+ */
 static bool send_msg_locked(uint32_t type, uint32_t flags, uint64_t pts_ns, const void* payload,
                             uint32_t size)
 {
-  if (g_client < 0)
+  if (!g_client_connected)
     return false;
 
-  struct apx_hdr hdr;
-  hdr.magic = APX_MAGIC;
-  hdr.type = type;
-  hdr.size = size;
-  hdr.flags = flags;
-  hdr.pts_ns = pts_ns;
+  const bool priming = g_priming;
 
-  /* Nothing has been committed yet, so if there is no room the whole message
-   * can be skipped. Dropping frames is survivable; dropping the connection
-   * would end playback, and Kodi legitimately stops reading for a moment
-   * whenever it reconfigures a decoder. */
-  if (!wait_writable(g_client, g_priming ? APX_PRIME_WRITE_WAIT_MS : APX_WRITE_WAIT_MS))
+  pthread_mutex_lock(&g_out_lock);
+
+  /*
+   * Only live video is held to the tight limit. It is the bulk of what goes
+   * through here and the only thing worth dropping, whereas audio frames are
+   * small and dropping them is audible -- letting a video stall squeeze the
+   * audio out would turn a moment of visual artefacts into a dropout.
+   */
+  const bool bulk = type == APX_MSG_VIDEO && !priming;
+  const size_t max_msgs = bulk ? APX_OUT_LIVE_MAX_MSGS : APX_OUT_MAX_MSGS;
+  const size_t max_bytes = bulk ? APX_OUT_LIVE_MAX_BYTES : APX_OUT_MAX_BYTES;
+  if (g_out_count >= max_msgs || g_out_bytes + size > max_bytes)
   {
-    /*
-     * A hole in the priming run cannot be skipped over: the frames after it
-     * reference what was lost. Drop the client instead, so it reconnects and
-     * is primed cleanly, rather than replaying the whole run at it on every
-     * frame from here on while it is already behind.
-     */
-    if (g_priming)
-    {
-      LOGI("consumer stalled while priming, dropping client to resync");
-      drop_client_locked();
-      return false;
-    }
-
     /*
      * Deliberately does not give up on being primed. Dropping a frame leaves
      * the decoder referencing something it never got, so the picture is wrong
@@ -435,20 +535,167 @@ static bool send_msg_locked(uint32_t type, uint32_t flags, uint64_t pts_ns, cons
      * every frame is swallowed and the picture stops entirely. Visible
      * artefacts that heal themselves beat a freeze that does not.
      */
-    g_dropped_msgs++;
-    if ((g_dropped_msgs % 50) == 1)
-      LOGI("consumer is behind, skipped %llu messages", (unsigned long long)g_dropped_msgs);
+    const unsigned long long dropped = ++g_dropped_msgs;
+    pthread_mutex_unlock(&g_out_lock);
+    if ((dropped % 50) == 1)
+      LOGI("consumer is behind, skipped %llu messages", dropped);
     return false;
   }
 
-  if (!write_all(g_client, &hdr, sizeof(hdr)) || (size && !write_all(g_client, payload, size)))
+  struct out_msg* msg = malloc(sizeof(*msg) + size);
+  if (!msg)
   {
-    /* Part-written: the framing is indeterminate and cannot be recovered. */
-    LOGI("write failed mid-message, dropping client");
-    drop_client_locked();
+    pthread_mutex_unlock(&g_out_lock);
     return false;
   }
+
+  msg->kind = OUT_MESSAGE;
+  msg->fd = -1;
+  msg->queued_ns = now_ns();
+  msg->priming = priming;
+  msg->hdr.magic = APX_MAGIC;
+  msg->hdr.type = type;
+  msg->hdr.size = size;
+  msg->hdr.flags = flags;
+  msg->hdr.pts_ns = pts_ns;
+  msg->size = size;
+  if (size)
+    memcpy(msg->payload, payload, size);
+
+  out_push_locked(msg);
+  pthread_mutex_unlock(&g_out_lock);
   return true;
+}
+
+/* Count a message the consumer never got, and say so occasionally. */
+static void note_dropped(void)
+{
+  pthread_mutex_lock(&g_out_lock);
+  const unsigned long long dropped = ++g_dropped_msgs;
+  pthread_mutex_unlock(&g_out_lock);
+  if ((dropped % 50) == 1)
+    LOGI("consumer is behind, skipped %llu messages", dropped);
+}
+
+/*
+ * The only thread that touches the client socket, which is why nothing else
+ * has to be locked against it.
+ */
+static void* writer_thread(void* arg)
+{
+  int fd = -1;
+  uint32_t gen = 0;
+
+  while (g_running)
+  {
+    pthread_mutex_lock(&g_out_lock);
+    while (!g_out_head && g_running)
+    {
+      /* Timed, so shutting down is noticed without needing to be woken. */
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_nsec += 200000000;
+      if (ts.tv_nsec >= 1000000000)
+      {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+      }
+      pthread_cond_timedwait(&g_out_cv, &g_out_lock, &ts);
+    }
+    struct out_msg* msg = g_out_head;
+    if (msg)
+    {
+      g_out_head = msg->next;
+      if (!g_out_head)
+        g_out_tail = NULL;
+      g_out_count--;
+      g_out_bytes -= msg->size;
+    }
+    pthread_mutex_unlock(&g_out_lock);
+
+    if (!msg)
+      continue;
+
+    if (msg->kind == OUT_NEW_CLIENT)
+    {
+      if (fd >= 0)
+        close(fd);
+      fd = msg->fd;
+      gen = msg->gen;
+      free(msg);
+      continue;
+    }
+
+    if (fd < 0)
+    {
+      free(msg); /* queued for a client that has since gone */
+      continue;
+    }
+
+    /*
+     * Live video that waited too long is history. Writing it would put the
+     * session permanently that far behind the phone, and the frames after it
+     * repair the picture soon enough. A keyframe is never thrown away: it is
+     * what the repair is made of.
+     */
+    if (!msg->priming && msg->hdr.type == APX_MSG_VIDEO &&
+        !(msg->hdr.flags & APX_FLAG_KEYFRAME) && now_ns() - msg->queued_ns > APX_OUT_STALE_NS)
+    {
+      note_dropped();
+      free(msg);
+      continue;
+    }
+
+    bool drop_client = false;
+
+    if (!wait_writable(fd, msg->priming ? APX_PRIME_WRITE_WAIT_MS : APX_WRITE_WAIT_MS))
+    {
+      /*
+       * Nothing has been committed yet, so the message can simply be skipped
+       * -- except during priming, where a hole cannot be skipped over because
+       * the frames after it reference what was lost. Drop the client instead,
+       * so it reconnects and is primed cleanly rather than being replayed at
+       * on every frame from here on while it is already behind.
+       */
+      if (msg->priming)
+      {
+        LOGI("consumer stalled while priming, dropping client to resync");
+        drop_client = true;
+      }
+      else
+      {
+        note_dropped();
+      }
+    }
+    else if (!write_all(fd, &msg->hdr, sizeof(msg->hdr)) ||
+             (msg->size && !write_all(fd, msg->payload, msg->size)))
+    {
+      /* Part-written: the framing is indeterminate and cannot be recovered. */
+      LOGI("write failed mid-message, dropping client");
+      drop_client = true;
+    }
+
+    free(msg);
+
+    if (drop_client)
+    {
+      close(fd);
+      fd = -1;
+      LOGI("client disconnected");
+      pthread_mutex_lock(&g_lock);
+      /* Only if it has not already been replaced by a newer connection. */
+      if (g_client_gen == gen)
+        reset_client_state_locked();
+      pthread_mutex_unlock(&g_lock);
+    }
+  }
+
+  if (fd >= 0)
+    close(fd);
+  pthread_mutex_lock(&g_out_lock);
+  out_clear_locked();
+  pthread_mutex_unlock(&g_out_lock);
+  return NULL;
 }
 
 /*
@@ -802,7 +1049,7 @@ static const char* request_playback_locked(void)
  */
 static bool should_reoffer_locked(void)
 {
-  if (g_client >= 0 || g_session.player_open)
+  if (g_client_connected || g_session.player_open)
     return false;
 
   uint64_t now = now_ns();
@@ -1077,7 +1324,7 @@ static void cb_audio_get_format(void* cls, unsigned char* ct, unsigned short* sp
 
 static void send_streaminfo_locked(void)
 {
-  if (g_sent_streaminfo || g_client < 0)
+  if (g_sent_streaminfo || !g_client_connected)
     return;
 
   /* Kodi will not open an H.264/HEVC codec without extradata, so hold the
@@ -1158,9 +1405,9 @@ static void cb_video_process(void* cls, raop_ntp_t* ntp, video_decode_struct* da
     LOGI("video: in=%llu out=%llu audio_out=%llu skipped=%llu last=%d bytes params=%zu client=%s",
          (unsigned long long)g_frames_in, (unsigned long long)g_frames_out,
          (unsigned long long)g_audio_out, (unsigned long long)g_dropped_msgs, data->data_len,
-         g_params_len, g_client >= 0 ? "yes" : "no");
+         g_params_len, g_client_connected ? "yes" : "no");
 
-  if (g_client < 0)
+  if (!g_client_connected)
   {
     const char* play = should_reoffer_locked() ? request_playback_locked() : NULL;
     pthread_mutex_unlock(&g_lock);
@@ -1300,9 +1547,9 @@ static void cb_audio_process(void* cls, raop_ntp_t* ntp, audio_decode_struct* da
   if (g_verbose && (g_audio_in <= 3 || (g_audio_in % 400) == 0))
     LOGI("audio: in=%llu out=%llu ct=%u mode=%s primed=%d client=%s",
          (unsigned long long)g_audio_in, (unsigned long long)g_audio_out, g_info.audio_ct,
-         mode_name(g_session.mode), (int)g_primed, g_client >= 0 ? "yes" : "no");
+         mode_name(g_session.mode), (int)g_primed, g_client_connected ? "yes" : "no");
 
-  if (g_client < 0)
+  if (!g_client_connected)
   {
     const char* play = should_reoffer_locked() ? request_playback_locked() : NULL;
     pthread_mutex_unlock(&g_lock);
@@ -1945,13 +2192,40 @@ static void* accept_thread(void* arg)
     int sndbuf = 128 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
+    /*
+     * Anything still queued was meant for the client being replaced, and
+     * would otherwise be written to this one, which has not been told what
+     * the stream is yet. The handover goes in behind it so the writer closes
+     * the old descriptor at the right point in the sequence.
+     */
+    struct out_msg* handover = malloc(sizeof(*handover));
+    if (!handover)
+    {
+      close(fd);
+      continue;
+    }
+    handover->kind = OUT_MESSAGE; /* filled in below, under the lock */
+    handover->fd = fd;
+    handover->size = 0;
+    handover->priming = false;
+    handover->queued_ns = now_ns();
+
+    /*
+     * All of this under g_lock, so nothing can start producing for the new
+     * client until the handover is behind it in the queue -- otherwise its
+     * first frames would be written to the socket being replaced.
+     */
     pthread_mutex_lock(&g_lock);
-    drop_client_locked();
-    g_client = fd;
-    g_sent_streaminfo = false;
-    g_sent_params = false;
-    g_primed = false;
-    g_video_started = false;
+    reset_client_state_locked();
+    handover->kind = OUT_NEW_CLIENT;
+    handover->gen = ++g_client_gen;
+
+    pthread_mutex_lock(&g_out_lock);
+    out_clear_locked();
+    out_push_locked(handover);
+    pthread_mutex_unlock(&g_out_lock);
+
+    g_client_connected = true;
     g_have_base = false; /* timeline restarts from the priming keyframe */
     g_last_audio_ns = 0;
     LOGI("client connected");
@@ -2062,6 +2336,13 @@ int main(int argc, char** argv)
 
   pthread_t th;
   pthread_create(&th, NULL, accept_thread, &listener);
+
+  pthread_t writer;
+  if (pthread_create(&writer, NULL, writer_thread, NULL) != 0)
+  {
+    LOGI("could not start the writer thread");
+    return 1;
+  }
 
   char mac[6];
   if (get_mac(getenv("AIRPLAY_IFACE"), mac) != 0)
@@ -2277,8 +2558,8 @@ int main(int argc, char** argv)
   while (g_running)
   {
     pthread_mutex_lock(&g_lock);
-    const bool busy = g_session.mode != MODE_IDLE || g_client >= 0;
-    if (g_session.mode == MODE_MIRROR && g_client >= 0 && g_primed && g_have_base &&
+    const bool busy = g_session.mode != MODE_IDLE || g_client_connected;
+    if (g_session.mode == MODE_MIRROR && g_client_connected && g_primed && g_have_base &&
         g_last_video_send_ns && now_ns() - g_last_video_send_ns > APX_KEEPALIVE_AFTER_NS)
     {
       send_keepalive_locked();
@@ -2320,6 +2601,8 @@ int main(int argc, char** argv)
   }
 
   LOGI("shutting down");
+  pthread_cond_broadcast(&g_out_cv);
+  pthread_join(writer, NULL);
   dnssd_unregister_raop(g_dnssd);
   dnssd_unregister_airplay(g_dnssd);
   raop_stop_httpd(g_raop);
