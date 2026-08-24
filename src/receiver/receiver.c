@@ -146,13 +146,6 @@ static uint64_t g_mirror_stop_pending_ns;
  */
 static bool g_video_seen_playing;
 
-/*
- * Where the sender said the video should start. Reported back while Kodi is
- * opening the stream: answering that we are at zero, when it has just asked
- * for the video from three quarters of the way in, is answered by the sender
- * scrubbing to zero and pausing.
- */
-static double g_video_start_position;
 
 /*
  * How long to hold that stop before acting on it.
@@ -1184,7 +1177,6 @@ static void end_session(void)
   g_unstartable_since_ns = 0;
   g_mirror_stop_pending_ns = 0;
   g_video_seen_playing = false;
-  g_video_start_position = 0.0;
   memset(&g_info, 0, sizeof(g_info));
   g_info.sample_rate = 44100;
   g_info.channels = 2;
@@ -2083,7 +2075,6 @@ static void cb_on_video_play(void* cls, const char* location, const float start_
   g_session.notify_video_ended = false;
   session_set_mode_locked(MODE_VIDEO);
   g_video_start_ns = now_ns();
-  g_video_start_position = start_position > 0.0f ? (double)start_position : 0.0;
   g_session.player_open = true; /* so a later teardown still asks for a stop */
   pthread_mutex_unlock(&g_lock);
 
@@ -2150,7 +2141,6 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
   }
   const session_mode_t mode = g_session.mode;
   const uint64_t video_start_ns = g_video_start_ns;
-  const double start_position_wanted = g_video_start_position;
   /*
    * A duration is what says this is the video rather than what came before
    * it. Kodi is still winding down the mirror stream when the first polls
@@ -2208,7 +2198,19 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
      * The rate says playing: a handover is a request to play, and this is the
      * gap before Kodi has the stream open, not a pause.
      */
-    info->position = start_position_wanted;
+    /*
+     * Say the information is not available, which is what a position of -1
+     * means to the library: it answers the poll without a body rather than
+     * describing the video. Making numbers up instead is what we did before,
+     * and there is nothing honest to put in them -- Kodi has not opened the
+     * stream, so there is no position, and no duration either. A duration of
+     * zero says the item has no length, which is not true and is the sort of
+     * thing a sender is entitled to give up on.
+     *
+     * Not a duration of -1: that means the video has finished, and the
+     * library answers it by disconnecting the sender.
+     */
+    info->position = -1.0;
     info->duration = 0.0;
     info->rate = 1.0f;
     info->ready_to_play = true;
