@@ -139,6 +139,14 @@ static uint64_t g_unstartable_since_ns;
 static uint64_t g_mirror_stop_pending_ns;
 
 /*
+ * Whether Kodi has been seen actually playing the video the sender handed
+ * over. Once it has, it no longer being played means the video is over, and
+ * the start-up grace below does not apply -- that grace is only for the
+ * window before Kodi has got going.
+ */
+static bool g_video_seen_playing;
+
+/*
  * How long to hold that stop before acting on it.
  *
  * A sender switching from mirroring to streaming a video usually says so
@@ -1024,6 +1032,23 @@ static bool json_time_seconds(const char* json, const char* field, double* out)
 static bool kodi_playback_state(double* position, double* duration, float* rate)
 {
   char reply[1024];
+
+  /*
+   * Whether anything is playing at all, first.
+   *
+   * Player.GetProperties answers for a player that does not exist with a
+   * successful result full of zeros rather than an error, so on its own it
+   * cannot tell "a video that has just started" from "nothing is playing".
+   * Reading it as the former when the latter is true is what left a sender
+   * being told its video was still going after playback had been stopped
+   * here: it never learned the video had ended, so pressing play on the phone
+   * only asked to resume something Kodi no longer had.
+   */
+  static const char* actives =
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Player.GetActivePlayers\"}";
+  if (!kodi_rpc(actives, reply, sizeof(reply)) || !strstr(reply, "\"playerid\""))
+    return false;
+
   static const char* req =
       "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Player.GetProperties\","
       "\"params\":{\"playerid\":1,\"properties\":[\"time\",\"totaltime\",\"speed\"]}}";
@@ -1149,6 +1174,7 @@ static void end_session(void)
   g_said_waiting_keyframe = false;
   g_unstartable_since_ns = 0;
   g_mirror_stop_pending_ns = 0;
+  g_video_seen_playing = false;
   memset(&g_info, 0, sizeof(g_info));
   g_info.sample_rate = 44100;
   g_info.channels = 2;
@@ -2020,6 +2046,7 @@ static void cb_on_video_play(void* cls, const char* location, const float start_
   pthread_mutex_lock(&g_lock);
   /* This is the handoff the pending stop was waiting for. */
   g_mirror_stop_pending_ns = 0;
+  g_video_seen_playing = false;
   session_set_mode_locked(MODE_VIDEO);
   g_video_start_ns = now_ns();
   g_session.player_open = true; /* so a later teardown still asks for a stop */
@@ -2085,6 +2112,9 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
   }
   const session_mode_t mode = g_session.mode;
   const uint64_t video_start_ns = g_video_start_ns;
+  if (playing && mode == MODE_VIDEO)
+    g_video_seen_playing = true;
+  const bool seen_playing = g_video_seen_playing;
   pthread_mutex_unlock(&g_lock);
 
   /* Something else has taken the player; report the video as finished so the
@@ -2109,7 +2139,7 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
    * has none, a video does. That does mean a genuinely live video stays
    * "loading" until the grace period runs out.
    */
-  if (mode == MODE_VIDEO && duration <= 0.0 &&
+  if (mode == MODE_VIDEO && !seen_playing && duration <= 0.0 &&
       now_ns() - video_start_ns < APX_VIDEO_START_GRACE_NS)
   {
     static uint64_t logged_for;
