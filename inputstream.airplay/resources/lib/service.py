@@ -551,12 +551,6 @@ class AirPlayPlayer(xbmc.Player):
 EVENTS = queue.Queue()
 
 
-# Set whenever there is something for the service loop to do, so it can sleep
-# between sessions instead of polling twenty times a second, without costing a
-# session anything at the moment it starts.
-WAKE = threading.Event()
-
-
 def read_events(process):
     """Pass the daemon's output on: events to the service thread, the rest to
     the log.
@@ -572,7 +566,6 @@ def read_events(process):
             continue
         if line.startswith('EVENT '):
             EVENTS.put(line)
-            WAKE.set()
         else:
             log('receiver: {}'.format(line))
 
@@ -688,12 +681,17 @@ class AirPlayMonitor(xbmc.Monitor):
         # Kodi may deliver this as the bare message or namespaced as
         # "Other.<message>", depending on how it was raised.
         name = method.split('.')[-1].lower()
+        if name == 'forget':
+            # The settings screen's button. NotifyAll rather than RunScript:
+            # Kodi will not run a script for an add-on that is not one, and
+            # this service is already listening.
+            forget_devices()
+            return
         command = DACP_COMMANDS.get(name)
         if not command:
             log('ignoring unknown notification "{}"'.format(method), xbmc.LOGDEBUG)
         elif DACP['token']:
             DACP_QUEUE.put(command)
-            WAKE.set()
         else:
             log('no sender to send "{}" to'.format(name), xbmc.LOGDEBUG)
 
@@ -778,11 +776,13 @@ def main():
         service_pending_audio()
         drain_dacp()
 
-        # Nothing to poll for between sessions: read_events and onNotification
-        # both wake this up the moment there is.
-        idle = not PENDING_AUDIO['due'] and not PLAYING['url'] and DACP_QUEUE.empty()
-        if WAKE.wait(0.5 if idle else 0.05):
-            WAKE.clear()
+        # Short on purpose, and waitForAbort specifically: it is also what
+        # lets Kodi deliver this add-on's monitor callbacks, so onNotification
+        # and onSettingsChanged only arrive while this is being called. A
+        # longer wait between sessions would save a little idle work and cost
+        # that much again in the time it takes a session to start.
+        if monitor.waitForAbort(0.05):
+            break
 
     if process is not None and process.poll() is None:
         log('stopping receiver')

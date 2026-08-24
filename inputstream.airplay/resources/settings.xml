@@ -56,7 +56,7 @@
         </setting>
         <setting id="forgetdevices" type="action" label="30018" help="30019">
           <level>0</level>
-          <data>RunScript(inputstream.airplay,forget)</data>
+          <data>NotifyAll(inputstream.airplay,forget)</data>
           <control type="button" format="action">
             <close>false</close>
           </control>
