@@ -1,3 +1,11 @@
+v0.1.5
+- Fixes a framing error that could take Kodi down with it.
+- The socket moves to Kodi's temp directory, which fits inside the length
+  limit macOS puts on one; cover art and paired devices stay in the profile.
+- UxPlay is declared as an add-on dependency rather than downloaded during
+  configure.
+- Says so in the log if Kodi's own AirPlay receiver is enabled too.
+
 v0.1.4
 - Fixes the settings screen's "forget paired devices" button, and the
   transport commands a keymap can raise, which 0.1.3 stopped delivering.
