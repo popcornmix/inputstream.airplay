@@ -69,12 +69,16 @@ jobs:
     - name: Build
       run: cmake --build ${app_id}/build
 
-    # Run against the installed add-on rather than the source tree: addon.xml
-    # is generated from addon.xml.in at build time, and the checker reads it.
+    # Run against the built add-on rather than the source tree: addon.xml is
+    # generated from addon.xml.in during the build, and the checker reads it.
     - name: Check add-on
       if: matrix.name == 'Linux GCC build'
       run: |
-        cmake --install ${app_id}/build --prefix ${{ github.workspace }}/xbmc/addons || true
         python3 -m pip install --quiet kodi-addon-checker
-        kodi-addon-checker --branch=piers \
-          ${{ github.workspace }}/xbmc/addons/${app_id}
+        addon_xml=$(find ${{ github.workspace }}/xbmc/addons -name addon.xml \
+                    -path "*${app_id}*" | head -1)
+        if [ -z "${addon_xml}" ]; then
+          echo "no built add-on found to check" >&2
+          exit 1
+        fi
+        kodi-addon-checker --branch=piers "$(dirname "${addon_xml}")"
