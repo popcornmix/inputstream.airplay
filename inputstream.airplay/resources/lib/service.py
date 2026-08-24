@@ -158,6 +158,28 @@ def active_player_id():
 # apply it to, kept so it can be applied once there is one.
 PENDING_RATE = {'play': None}
 
+# Where the sender asked the video to start, applied once the stream is up.
+PENDING_SEEK = {'position': 0.0}
+
+
+def apply_pending_seek():
+    """Move to where the sender asked the video to start.
+
+    Waiting for isPlaying() was not enough: it goes true while the stream is
+    still opening, and a seek issued then is silently dropped -- a video handed
+    over half way through started from the beginning instead. onAVStarted means
+    a frame has been rendered, so the stream is really there to seek in.
+    """
+    position = PENDING_SEEK['position']
+    if position <= 1.0:
+        return
+    PENDING_SEEK['position'] = 0.0
+    try:
+        log('seeking to {:.1f}s, where the sender handed the video over'.format(position))
+        xbmc.Player().seekTime(position)
+    except RuntimeError as error:
+        log('could not seek to {:.1f}s: {}'.format(position, error), xbmc.LOGWARNING)
+
 
 def set_playing(play):
     """Set play/pause absolutely.
@@ -419,6 +441,7 @@ def start_playback():
             xbmc.sleep(25)
 
     PENDING_RATE['play'] = None
+    PENDING_SEEK['position'] = 0.0
     PLAYING['url'] = STREAM_URL
     player.play(STREAM_URL, build_item())
 
@@ -459,16 +482,11 @@ def start_hls(url, start_position):
     # Anything held over belongs to the stream being replaced; the sender sets
     # the rate for this one just after handing it over.
     PENDING_RATE['play'] = None
+    # Seeking is left until the stream is actually up; see apply_pending_seek.
+    PENDING_SEEK['position'] = start_position if start_position > 1.0 else 0.0
     PLAYING['url'] = url
     log('airplay video: playing {} from {:.1f}s'.format(url, start_position))
     player.play(url, item)
-    if start_position > 1.0:
-        # Kodi needs the stream open before a seek will stick.
-        for _ in range(50):
-            if xbmc.Player().isPlaying():
-                xbmc.Player().seekTime(start_position)
-                break
-            xbmc.sleep(100)
 
 
 def stop_playback():
@@ -624,8 +642,10 @@ class AirPlayPlayer(xbmc.Player):
         DACP_QUEUE.put(command)
 
     def onAVStarted(self):
-        # The stream is open now, so a rate the sender asked for while it was
-        # opening can finally be applied.
+        # The stream is really open now: a frame has been rendered. Both the
+        # position the sender asked for and any rate it set while we were
+        # getting there can be applied.
+        apply_pending_seek()
         apply_pending_rate()
 
     def onPlayBackPaused(self):
