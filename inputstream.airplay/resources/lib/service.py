@@ -35,6 +35,13 @@ ADDON_ID = ADDON.getAddonInfo('id')
 ADDON_PATH = xbmcvfs.translatePath(ADDON.getAddonInfo('path'))
 PROFILE = xbmcvfs.translatePath(ADDON.getAddonInfo('profile'))
 
+# A unix socket path is limited to 104 bytes on macOS, and a profile directory
+# under a long home directory name can use most of that on its own, so the
+# socket goes somewhere short instead. Both halves resolve this same rule
+# independently; see the note in proto.h. Everything that has no length limit
+# -- cover art, the list of paired devices -- stays in the profile.
+SOCKET = xbmcvfs.translatePath('special://temp/airplay.sock')
+
 
 def receiver_path():
     """Where the daemon binary is.
@@ -51,16 +58,6 @@ def receiver_path():
         return binary
     return os.path.join(ADDON_PATH, 'airplay-receiver')
 
-# Kept short on purpose: a unix socket path has about a hundred characters to
-# play with, fewer on macOS than on Linux, and the profile path is already
-# most of that on some systems.
-SOCKET = os.path.join(PROFILE, 'receiver.sock')
-
-# The inputstream side runs inside Kodi rather than as a child of this script,
-# so it cannot inherit the path. Putting it in Kodi's own environment is how it
-# finds out; without this it falls back to a compiled-in default that only
-# happens to be right on the system it was built for.
-os.environ['AIRPLAY_SOCKET'] = SOCKET
 STREAM_URL = 'airplay://mirror'
 
 
@@ -103,23 +100,52 @@ def kodi_rpc(method, params=None):
         return None
 
 
-def use_inprocess_rpc():
-    """Decide how to reach JSON-RPC, once, before anything is playing.
+def kodi_setting(name):
+    """Read one of Kodi's own settings, in-process.
 
-    The loopback server is off unless "allow remote control from applications
-    on this system" is on. Without this check, turning that off silently cost
-    play/pause, volume and the video-streaming progress reports.
+    Deliberately not through kodi_rpc: this is used to decide how kodi_rpc
+    should work.
     """
     try:
         reply = json.loads(xbmc.executeJSONRPC(json.dumps(
             {'jsonrpc': '2.0', 'id': 1, 'method': 'Settings.GetSettingValue',
-             'params': {'setting': 'services.esenabled'}})))
-        enabled = (reply.get('result') or {}).get('value')
+             'params': {'setting': name}})))
+        return (reply.get('result') or {}).get('value')
     except (ValueError, AttributeError):
+        return None
+
+
+def use_inprocess_rpc():
+    """Decide how to reach JSON-RPC.
+
+    The loopback server is off unless "allow remote control from applications
+    on this system" is on. Without this check, turning that off silently cost
+    play/pause, volume and the video-streaming progress reports. Re-checked
+    whenever any setting changes, since it can be turned off mid-session.
+    """
+    enabled = kodi_setting('services.esenabled')
+    if enabled is None:
         return
-    if enabled is False:
-        _INPROC_RPC[0] = True
-        log('remote control is off, so JSON-RPC will be called in-process')
+    inproc = enabled is False
+    if inproc != _INPROC_RPC[0]:
+        _INPROC_RPC[0] = inproc
+        log('remote control is {}, so JSON-RPC will be called {}'.format(
+            'off' if inproc else 'on', 'in-process' if inproc else 'over the loopback socket'))
+
+
+def warn_about_core_airplay():
+    """Say something if Kodi's own AirPlay receiver is also running.
+
+    Both advertise under the same device name, so the sender shows two
+    identical targets and picking the wrong one does nothing recognisable.
+    Nothing here can turn it off -- that is the user's call -- but an
+    unexplained duplicate is worth a line in the log.
+    """
+    for name, what in (('services.airplay', 'AirPlay'), ('services.airtunes', 'AirTunes')):
+        if kodi_setting(name) is True:
+            log("Kodi's own {} receiver is enabled as well as this add-on; the sender "
+                'will show two devices with the same name. Turn it off under '
+                'Settings / Services / AirPlay.'.format(what), xbmc.LOGWARNING)
 
 
 def active_player_id():
@@ -241,6 +267,7 @@ def receiver_env():
     env['AIRPLAY_MIRRORING'] = '1' if setting_bool('mirroring', True) else '0'
     env['AIRPLAY_PAIRING'] = '1' if setting_bool('pairing', False) else '0'
     env['AIRPLAY_REGISTRY'] = os.path.join(PROFILE, 'paired-devices')
+    env['AIRPLAY_ART_DIR'] = PROFILE
     width, height, refresh = display_mode()
     env['AIRPLAY_WIDTH'] = width
     env['AIRPLAY_HEIGHT'] = height
@@ -701,6 +728,9 @@ class AirPlayMonitor(xbmc.Monitor):
         self.restart_wanted = False
 
     def onSettingsChanged(self):
+        # Fires for any settings change, not just this add-on's, which is
+        # exactly what makes it the right place to re-read Kodi's own.
+        use_inprocess_rpc()
         current = receiver_settings()
         if current != self.settings:
             self.settings = current
@@ -718,6 +748,7 @@ RESTART_STABLE_AFTER = 30.0
 def main():
     monitor = AirPlayMonitor()
     use_inprocess_rpc()
+    warn_about_core_airplay()
     # Held for the life of the service: a Player that goes out of scope stops
     # receiving callbacks.
     player = AirPlayPlayer()
@@ -776,11 +807,16 @@ def main():
         service_pending_audio()
         drain_dacp()
 
-        # Short on purpose, and waitForAbort specifically: it is also what
-        # lets Kodi deliver this add-on's monitor callbacks, so onNotification
-        # and onSettingsChanged only arrive while this is being called. A
-        # longer wait between sessions would save a little idle work and cost
-        # that much again in the time it takes a session to start.
+        # waitForAbort specifically, because it is also what lets Kodi deliver
+        # this add-on's monitor callbacks -- replacing it with an event of our
+        # own silently stopped onNotification and onSettingsChanged arriving.
+        #
+        # The 0.05 is not what makes that work: waitForAbort loops internally
+        # in 100ms slices and pumps callbacks after each one, whatever timeout
+        # it is given. It is how quickly the queue above is drained, and the
+        # event that starts a session arrives while nothing is playing -- so a
+        # longer wait when idle, which is the tempting saving, would land
+        # squarely on the session start latency this add-on exists to keep low.
         if monitor.waitForAbort(0.05):
             break
 

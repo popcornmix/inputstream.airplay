@@ -13,6 +13,8 @@
 
 #include "InputStreamAirPlay.h"
 
+#include <kodi/Filesystem.h>
+
 #include <cerrno>
 #include <cstring>
 #include <poll.h>
@@ -130,9 +132,15 @@ bool CInputStreamAirPlay::Open(const kodi::addon::InputstreamProperty& props)
 {
   m_verbose = kodi::addon::GetSettingBoolean("debuglog", false);
 
-  /* The service publishes this into Kodi's environment when it starts, since
-   * it knows the profile directory and this half does not. */
-  m_socketPath = APX_DEFAULT_SOCKET;
+  /*
+   * The same rule the service uses, resolved independently rather than passed
+   * across: putenv() in a running Kodi races anything else calling getenv(),
+   * and a unix socket path is short enough -- 104 bytes on macOS -- that the
+   * profile directory does not reliably fit. special://temp does.
+   *
+   * AIRPLAY_SOCKET stays as the override for running the receiver by hand.
+   */
+  m_socketPath = kodi::vfs::TranslateSpecialProtocol(APX_SOCKET_SPECIAL);
   const char* env = std::getenv("AIRPLAY_SOCKET");
   if (env && *env)
     m_socketPath = env;
@@ -334,19 +342,10 @@ DEMUX_PACKET* CInputStreamAirPlay::DemuxRead()
     return AllocateDemuxPacket(0); /* nothing yet, ask again */
   }
 
-  if (hdr.magic != APX_MAGIC)
+  if (hdr.magic != APX_MAGIC || hdr.size > APX_MAX_PAYLOAD)
   {
-    kodi::Log(ADDON_LOG_ERROR, "airplay: lost framing, ending stream");
-    return nullptr;
-  }
-
-  /* Nothing legitimate comes close to the cap, so a size beyond it means the
-   * stream is not what it claims to be. Checked before anything is sized from
-   * it: as a signed int a large enough value goes negative, and Kodi hands
-   * back a packet with no buffer for it. */
-  if (hdr.size > APX_MAX_PAYLOAD)
-  {
-    kodi::Log(ADDON_LOG_ERROR, "airplay: refusing a %u byte packet, ending stream", hdr.size);
+    kodi::Log(ADDON_LOG_ERROR, "airplay: lost framing (magic %08x, size %u), ending stream",
+              hdr.magic, hdr.size);
     return nullptr;
   }
 

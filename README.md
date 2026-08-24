@@ -71,9 +71,17 @@ cmake -B build \
 cmake --build build
 ```
 
-Needs OpenSSL and libplist. UxPlay is downloaded during configure; to build
-without network access, unpack it yourself and pass
-`-DUXPLAY_SOURCE_DIR=/path/to/UxPlay`.
+Needs OpenSSL and libplist.
+
+UxPlay comes from `depends/common/uxplay`, which Kodi's add-on buildsystem
+builds first -- the commit and its checksum are pinned there. A bare `cmake` on
+this directory, with no add-on buildsystem around it, downloads the same commit
+during configure instead. Either way, to build with no network access unpack it
+yourself and pass `-DUXPLAY_SOURCE_DIR=/path/to/UxPlay`.
+
+Linux, macOS and FreeBSD. Not iOS, tvOS or UWP, which do not allow a process to
+be spawned, and not Android, which will not execute a binary out of the
+directory an app can write to.
 
 A Debian package can be built with `dpkg-buildpackage`.
 

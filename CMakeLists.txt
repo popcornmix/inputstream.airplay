@@ -42,7 +42,14 @@ endif()
 # GStreamer, and the point of this add-on is to hand the streams to Kodi
 # instead, so its top level CMakeLists is never used.
 #
-# Point UXPLAY_SOURCE_DIR at an unpacked UxPlay to build without fetching.
+# The source comes from whichever of these knows about it:
+#
+#  - UXPLAY_SOURCE_DIR, for a distribution that fetches its own sources.
+#  - Kodi's add-on buildsystem, which builds depends/common/uxplay first from
+#    the tarball cache or mirrors.kodi.tv. That is how the binary add-on build
+#    farm expects a third-party source to arrive, and the commit and checksum
+#    live in depends/common/uxplay/ -- keep them in step with the two below.
+#  - Otherwise a plain download, so a bare cmake build works on its own.
 # ---------------------------------------------------------------------------
 set(UXPLAY_VERSION "462153392f2e30937424922039ff9f0cda5e7b1a")
 set(UXPLAY_SHA256 "0f5bf6f2ab3d1ac3ccaf4418afe00137ec1ba97c2a345710202fca40f6a1fb85")
@@ -55,6 +62,9 @@ if(UXPLAY_SOURCE_DIR)
   endif()
   set(uxplay_SOURCE_DIR "${UXPLAY_SOURCE_DIR}")
   message(STATUS "inputstream.airplay: using UxPlay from ${uxplay_SOURCE_DIR}")
+elseif(ADDON_DEPENDS_PATH AND EXISTS "${ADDON_DEPENDS_PATH}/src/uxplay/lib/raop.h")
+  set(uxplay_SOURCE_DIR "${ADDON_DEPENDS_PATH}/src/uxplay")
+  message(STATUS "inputstream.airplay: using UxPlay from the add-on depends at ${uxplay_SOURCE_DIR}")
 else()
   include(FetchContent)
   message(STATUS "inputstream.airplay: fetching UxPlay ${UXPLAY_VERSION}")

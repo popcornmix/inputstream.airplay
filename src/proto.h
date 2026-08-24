@@ -17,9 +17,16 @@
 #define APX_MAGIC 0x31585041u /* "APX1" */
 
 /*
- * Fallback socket path, for running the receiver by hand. In an add-on both
- * ends take the path from AIRPLAY_SOCKET, which the service points at its own
- * profile directory -- the only place both are sure to be able to write.
+ * Where the socket lives. Both ends resolve this the same way and neither
+ * tells the other, so there is nothing to keep in step. special://temp rather
+ * than the add-on profile because a unix socket path is limited to 104 bytes
+ * on macOS, which a profile path can exceed on its own.
+ */
+#define APX_SOCKET_SPECIAL "special://temp/airplay.sock"
+
+/*
+ * Fallback for running the receiver by hand, outside Kodi, where nothing can
+ * resolve special://. Overridden with AIRPLAY_SOCKET.
  */
 #define APX_DEFAULT_SOCKET "/tmp/kodi-airplay.sock"
 

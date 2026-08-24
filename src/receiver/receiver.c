@@ -247,7 +247,7 @@ static bool g_hls_enabled;
 
 /* Client-access password, empty for none. Held for the life of the process
  * because the library asks for it on every unauthenticated request. */
-static char g_password[64];
+static char g_password[128];
 
 /* Whether the sender's volume slider is allowed to move Kodi's volume. */
 static bool g_volume_control;
@@ -301,9 +301,9 @@ static bool g_require_pairing;
 static char g_registry_path[256];
 
 /*
- * Where cover art is written, taken from the socket's own directory. The
- * add-on's profile is the one place both Kodi and the receiver are sure to be
- * able to write; /run is root's on an ordinary distribution.
+ * Where cover art is written. The add-on's profile, which the service passes
+ * in; /run is root's on an ordinary distribution. Falls back to the socket's
+ * directory when the receiver is run by hand.
  */
 static char g_art_dir[192];
 static uint64_t g_last_play_request_ns;
@@ -1287,10 +1287,13 @@ static void cb_audio_process(void* cls, raop_ntp_t* ntp, audio_decode_struct* da
    * never told about can have the demuxer bring that stream into being, which
    * would restore the stalling this setting exists to avoid.
    */
-  if (g_session.mode == MODE_MIRROR && !g_mirror_audio)
-    return;
-
   pthread_mutex_lock(&g_lock);
+
+  if (g_session.mode == MODE_MIRROR && !g_mirror_audio)
+  {
+    pthread_mutex_unlock(&g_lock);
+    return;
+  }
 
   g_audio_in++;
   g_audio_session_frames++;
@@ -1867,6 +1870,13 @@ static int make_listener(const char* path)
   snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
 
   /*
+   * The mode the socket is created with, rather than fixing it afterwards:
+   * between bind() and chmod() it would otherwise carry 0777 & ~umask, and a
+   * permissive umask would leave a window where anyone could connect.
+   */
+  const mode_t old_umask = umask(0177);
+
+  /*
    * A socket left behind by a hard kill has to go, but a live one means
    * another receiver is already running: taking it over would leave two
    * daemons advertising the same device and fighting over the add-on. Tell
@@ -1882,6 +1892,7 @@ static int make_listener(const char* path)
       if (live)
       {
         LOGI("another receiver is already listening on %s", path);
+        umask(old_umask);
         close(fd);
         return -1;
       }
@@ -1889,9 +1900,12 @@ static int make_listener(const char* path)
     unlink(path);
   }
 
-  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
+  const int bound = bind(fd, (struct sockaddr*)&addr, sizeof(addr));
+  const int bind_errno = errno;
+  umask(old_umask);
+  if (bound < 0)
   {
-    LOGI("bind(%s) failed: %s", path, strerror(errno));
+    LOGI("bind(%s) failed: %s", path, strerror(bind_errno));
     close(fd);
     return -1;
   }
@@ -1902,7 +1916,8 @@ static int make_listener(const char* path)
     return -1;
   }
   /*
-   * Owner only. The stream on this socket is the mirror of someone's phone
+   * Owner only, in case the umask above was not honoured -- some platforms
+   * ignore it for sockets. The stream here is the mirror of someone's phone
    * screen, and any process that connects also displaces the real client, so
    * it is not something to leave open to every local user.
    */
@@ -2021,9 +2036,17 @@ int main(int argc, char** argv)
   if (!sock_path || !*sock_path)
     sock_path = APX_DEFAULT_SOCKET;
 
-  const char* slash = strrchr(sock_path, '/');
-  if (slash && (size_t)(slash - sock_path) < sizeof(g_art_dir))
-    snprintf(g_art_dir, sizeof(g_art_dir), "%.*s", (int)(slash - sock_path), sock_path);
+  const char* art_dir = getenv("AIRPLAY_ART_DIR");
+  if (art_dir && *art_dir)
+  {
+    snprintf(g_art_dir, sizeof(g_art_dir), "%s", art_dir);
+  }
+  else
+  {
+    const char* slash = strrchr(sock_path, '/');
+    if (slash && (size_t)(slash - sock_path) < sizeof(g_art_dir))
+      snprintf(g_art_dir, sizeof(g_art_dir), "%.*s", (int)(slash - sock_path), sock_path);
+  }
 
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
@@ -2132,7 +2155,15 @@ int main(int argc, char** argv)
   if (getenv("AIRPLAY_PASSWORD_STDIN"))
   {
     if (fgets(g_password, sizeof(g_password), stdin))
-      g_password[strcspn(g_password, "\r\n")] = '\0';
+    {
+      char* end = strpbrk(g_password, "\r\n");
+      if (end)
+        *end = '\0';
+      else if (strlen(g_password) == sizeof(g_password) - 1)
+        LOGI("password is longer than %zu characters and has been cut short; "
+             "the sender will not accept the rest of it",
+             sizeof(g_password) - 1);
+    }
     fclose(stdin);
   }
   else
