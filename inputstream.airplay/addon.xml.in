@@ -5,7 +5,7 @@
   name="AirPlay Receiver"
   provider-name="popcornmix">
   <requires>@ADDON_DEPENDS@
-    <import addon="xbmc.python" version="3.0.0"/>
+    <import addon="xbmc.python" version="3.0.1"/>
   </requires>
   <extension
     point="kodi.inputstream"
