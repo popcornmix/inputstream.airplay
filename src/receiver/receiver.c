@@ -2112,7 +2112,15 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
   }
   const session_mode_t mode = g_session.mode;
   const uint64_t video_start_ns = g_video_start_ns;
-  if (playing && mode == MODE_VIDEO)
+  /*
+   * A duration is what says this is the video rather than what came before
+   * it. Kodi is still winding down the mirror stream when the first polls
+   * arrive, and that is playing too -- treating it as the video handed the
+   * sender the mirror stream's position and no duration, and skipped the
+   * grace below that exists precisely to avoid answering with another
+   * stream's numbers.
+   */
+  if (playing && mode == MODE_VIDEO && duration > 0.0)
     g_video_seen_playing = true;
   const bool seen_playing = g_video_seen_playing;
   pthread_mutex_unlock(&g_lock);

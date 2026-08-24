@@ -154,6 +154,11 @@ def active_player_id():
     return players[0]['playerid'] if players else None
 
 
+# A play or pause from the sender that arrived before there was a player to
+# apply it to, kept so it can be applied once there is one.
+PENDING_RATE = {'play': None}
+
+
 def set_playing(play):
     """Set play/pause absolutely.
 
@@ -161,11 +166,35 @@ def set_playing(play):
     and flipping it drifts out of step the moment an event is missed -- which
     is how a skip on the phone ended up leaving playback paused. JSON-RPC
     takes the state as a value.
+
+    A sender hands over a video and sets its rate in the same breath, so these
+    routinely arrive in the moment before Kodi has the stream open. Dropping
+    them then left the phone showing a state Kodi was not in, with no way back
+    into step, so one is held over instead.
     """
     playerid = active_player_id()
     if playerid is None:
+        PENDING_RATE['play'] = bool(play)
+        log('no player for "{}" yet, holding it until there is'.format(
+            'play' if play else 'pause'), xbmc.LOGDEBUG)
         return
+    PENDING_RATE['play'] = None
     kodi_rpc('Player.PlayPause', {'playerid': playerid, 'play': bool(play)})
+
+
+def apply_pending_rate():
+    """Apply a rate the sender asked for before playback had started."""
+    play = PENDING_RATE['play']
+    if play is None:
+        return
+    PENDING_RATE['play'] = None
+    playerid = active_player_id()
+    if playerid is None:
+        return
+    log('applying the {} the sender asked for while the stream was opening'.format(
+        'play' if play else 'pause'))
+    guard_echo()
+    kodi_rpc('Player.PlayPause', {'playerid': playerid, 'play': play})
 
 
 def log(message, level=xbmc.LOGINFO):
@@ -389,6 +418,7 @@ def start_playback():
                 break
             xbmc.sleep(25)
 
+    PENDING_RATE['play'] = None
     PLAYING['url'] = STREAM_URL
     player.play(STREAM_URL, build_item())
 
@@ -426,6 +456,9 @@ def start_hls(url, start_position):
                 break
             xbmc.sleep(25)
 
+    # Anything held over belongs to the stream being replaced; the sender sets
+    # the rate for this one just after handing it over.
+    PENDING_RATE['play'] = None
     PLAYING['url'] = url
     log('airplay video: playing {} from {:.1f}s'.format(url, start_position))
     player.play(url, item)
@@ -589,6 +622,11 @@ class AirPlayPlayer(xbmc.Player):
         except RuntimeError:
             return
         DACP_QUEUE.put(command)
+
+    def onAVStarted(self):
+        # The stream is open now, so a rate the sender asked for while it was
+        # opening can finally be applied.
+        apply_pending_rate()
 
     def onPlayBackPaused(self):
         self._relay('pause')
