@@ -179,12 +179,6 @@ static uint64_t g_video_start_ns;
  */
 #define APX_VIDEO_START_GRACE_NS (10ull * 1000000000ull)
 
-/*
- * How long after a video handover a pause from the sender is taken to be part
- * of the handover rather than an instruction. The ones seen arrive about a
- * third of a second after it.
- */
-#define APX_RATE_SETTLE_NS (1500ull * 1000000ull)
 
 /*
  * The session state, and g_mirror_to_video above it, are written from
@@ -1417,8 +1411,16 @@ static void cb_audio_get_format(void* cls, unsigned char* ct, unsigned short* sp
          (int)*usingScreen, (int)*isMedia);
   }
 
-  /* usingScreen distinguishes mirroring audio from a plain music stream. */
-  if (!*usingScreen && g_info.video_codec == APX_VCODEC_NONE)
+  /*
+   * usingScreen distinguishes mirroring audio from a plain music stream.
+   *
+   * Not while a video is streaming, though. A sender casting a video
+   * negotiates a RAOP audio channel for it as well, and that arrives after
+   * the video has been handed over -- so taking it for a music session
+   * demoted the video session a second in, and every poll after that told the
+   * sender there was no video, which stopped it dead.
+   */
+  if (!*usingScreen && g_info.video_codec == APX_VCODEC_NONE && g_session.mode != MODE_VIDEO)
     session_set_mode_locked(MODE_AUDIO);
   /* Nothing else will ask Kodi to open the stream for a music session. */
   const char* play = g_session.mode == MODE_AUDIO ? request_playback_locked() : NULL;
@@ -2083,31 +2085,6 @@ static void cb_on_video_rate(void* cls, const float rate)
   {
     LOGI("airplay video: ignoring rate %.2f", rate);
     return;
-  }
-
-  /*
-   * A sender that hands over a video it was already playing sets a rate of
-   * its own a moment later -- a play and then a pause about a third of a
-   * second after the handover, fourteen milliseconds apart, in every log of
-   * this. That is the phone settling its own player, not somebody asking for
-   * a pause, and obeying it starts the cast paused when what was asked for
-   * was to carry on watching.
-   *
-   * The handover already said what to do: play this video from here. So a
-   * pause arriving in the moment after it is not treated as an instruction.
-   * One that arrives later is somebody pressing pause, and is obeyed.
-   */
-  if (rate == 0.0f)
-  {
-    pthread_mutex_lock(&g_lock);
-    const bool settling = g_session.mode == MODE_VIDEO && g_video_start_ns &&
-                          now_ns() - g_video_start_ns < APX_RATE_SETTLE_NS;
-    pthread_mutex_unlock(&g_lock);
-    if (settling)
-    {
-      LOGI("airplay video: ignoring the pause that came with the handover");
-      return;
-    }
   }
 
   emit_event_arg("RATE", rate == 0.0f ? "0" : "1");
