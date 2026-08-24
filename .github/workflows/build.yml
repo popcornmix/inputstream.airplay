@@ -75,8 +75,12 @@ jobs:
       if: matrix.name == 'Linux GCC build'
       run: |
         python3 -m pip install --quiet kodi-addon-checker
-        addon_xml=$(find ${{ github.workspace }}/xbmc/addons -name addon.xml \
-                    -path "*${app_id}*" | head -1)
+        # Matched on the trailing addons/<id>/addon.xml: the workspace path
+        # itself contains the add-on's name, so a looser pattern quietly
+        # matches one of Kodi's own bundled add-ons and passes for the wrong
+        # thing.
+        addon_xml=$(find ${{ github.workspace }}/${app_id} \
+                    -path "*/addons/${app_id}/addon.xml" | head -1)
         if [ -z "${addon_xml}" ]; then
           echo "no built add-on found to check" >&2
           exit 1
