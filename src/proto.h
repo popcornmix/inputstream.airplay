@@ -16,8 +16,19 @@
 
 #define APX_MAGIC 0x31585041u /* "APX1" */
 
-/* Default socket path; override with AIRPLAY_SOCKET in both processes. */
-#define APX_DEFAULT_SOCKET "/run/kodi-airplay.sock"
+/*
+ * Fallback socket path, for running the receiver by hand. In an add-on both
+ * ends take the path from AIRPLAY_SOCKET, which the service points at its own
+ * profile directory -- the only place both are sure to be able to write.
+ */
+#define APX_DEFAULT_SOCKET "/tmp/kodi-airplay.sock"
+
+/*
+ * Largest payload either end will accept. Real ones are far smaller -- a 4K
+ * keyframe is a megabyte or so -- and the cap exists so a corrupt or hostile
+ * length cannot be turned into an allocation.
+ */
+#define APX_MAX_PAYLOAD (8u * 1024u * 1024u)
 
 enum apx_msg_type
 {

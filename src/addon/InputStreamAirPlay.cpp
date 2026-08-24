@@ -128,6 +128,10 @@ bool CInputStreamAirPlay::TryReconnect()
 
 bool CInputStreamAirPlay::Open(const kodi::addon::InputstreamProperty& props)
 {
+  m_verbose = kodi::addon::GetSettingBoolean("debuglog", false);
+
+  /* The service publishes this into Kodi's environment when it starts, since
+   * it knows the profile directory and this half does not. */
   m_socketPath = APX_DEFAULT_SOCKET;
   const char* env = std::getenv("AIRPLAY_SOCKET");
   if (env && *env)
@@ -333,6 +337,16 @@ DEMUX_PACKET* CInputStreamAirPlay::DemuxRead()
   if (hdr.magic != APX_MAGIC)
   {
     kodi::Log(ADDON_LOG_ERROR, "airplay: lost framing, ending stream");
+    return nullptr;
+  }
+
+  /* Nothing legitimate comes close to the cap, so a size beyond it means the
+   * stream is not what it claims to be. Checked before anything is sized from
+   * it: as a signed int a large enough value goes negative, and Kodi hands
+   * back a packet with no buffer for it. */
+  if (hdr.size > APX_MAX_PAYLOAD)
+  {
+    kodi::Log(ADDON_LOG_ERROR, "airplay: refusing a %u byte packet, ending stream", hdr.size);
     return nullptr;
   }
 

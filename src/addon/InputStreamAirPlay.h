@@ -71,7 +71,10 @@ private:
   std::atomic<unsigned int> m_positionAnchorMs{0};
   std::atomic<unsigned int> m_lastAudioMs{0};
   int m_reconnectAttempts{0};
-  /* Per-packet logging, off unless the receiver was asked for extra logging. */
-  const bool m_verbose{std::getenv("AIRPLAY_DEBUG") != nullptr};
+  /* Per-packet logging, off unless the add-on's debug setting is on. Read
+   * once when the stream opens: an environment variable could not work here,
+   * because this half runs inside Kodi rather than as a child of the service
+   * that starts the receiver. */
+  bool m_verbose{false};
   std::string m_socketPath;
 };

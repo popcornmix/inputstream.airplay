@@ -4,7 +4,9 @@
   version="0.1.2"
   name="AirPlay Receiver"
   provider-name="popcornmix">
-  <requires>@ADDON_DEPENDS@</requires>
+  <requires>@ADDON_DEPENDS@
+    <import addon="xbmc.python" version="3.0.0"/>
+  </requires>
   <extension
     point="kodi.inputstream"
     name="airplay"
@@ -22,6 +24,7 @@
     <assets>
       <icon>icon.png</icon>
     </assets>
+    <news>Runs on macOS as well as Linux. The receiver socket and cover art moved into the add-on's own profile directory, so it no longer needs to write to /run. Verbose logging and forgetting paired devices are settings now. Remote control still works with Kodi's remote control service switched off.</news>
     <summary lang="en_GB">Mirror an iPhone or iPad screen to Kodi</summary>
     <description lang="en_GB">Receives AirPlay screen mirroring, video streamed from apps, and audio, and plays them through Kodi's own pipeline, so hardware decoding and the normal renderer are used.
 

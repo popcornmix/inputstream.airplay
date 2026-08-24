@@ -57,14 +57,16 @@ if(UXPLAY_SOURCE_DIR)
   message(STATUS "inputstream.airplay: using UxPlay from ${uxplay_SOURCE_DIR}")
 else()
   include(FetchContent)
+  message(STATUS "inputstream.airplay: fetching UxPlay ${UXPLAY_VERSION}")
+  # SOURCE_SUBDIR names a directory with no CMakeLists.txt in it, which is how
+  # MakeAvailable is told to unpack and stop -- UxPlay's own top level needs
+  # GStreamer. The alternative, FetchContent_Populate(uxplay), is deprecated
+  # as of CMake 3.30 and warns.
   FetchContent_Declare(uxplay
-    URL      "https://github.com/FDH2/UxPlay/archive/${UXPLAY_VERSION}.tar.gz"
-    URL_HASH SHA256=${UXPLAY_SHA256})
-  FetchContent_GetProperties(uxplay)
-  if(NOT uxplay_POPULATED)
-    message(STATUS "inputstream.airplay: fetching UxPlay ${UXPLAY_VERSION}")
-    FetchContent_Populate(uxplay)  # populate only: its top level needs GStreamer
-  endif()
+    URL           "https://github.com/FDH2/UxPlay/archive/${UXPLAY_VERSION}.tar.gz"
+    URL_HASH      SHA256=${UXPLAY_SHA256}
+    SOURCE_SUBDIR nothing-to-build-here)
+  FetchContent_MakeAvailable(uxplay)
 endif()
 
 set(NO_MARCH_NATIVE ON CACHE BOOL "" FORCE)  # upstream turns this on for x86

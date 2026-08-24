@@ -1,9 +1,9 @@
 Source: kodi-inputstream-airplay
 Priority: extra
-Maintainer: Nobody <nobody@kodi.tv>
-Build-Depends: debhelper (>= 9.0.0), cmake, libssl-dev, libplist-dev,
+Maintainer: Dom Cobley <popcornmix@gmail.com>
+Build-Depends: debhelper-compat (= 13), cmake, libssl-dev, libplist-dev,
                kodi-addon-dev
-Standards-Version: 4.1.2
+Standards-Version: 4.6.2
 Section: libs
 
 Package: kodi-inputstream-airplay

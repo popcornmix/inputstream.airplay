@@ -15,6 +15,7 @@ import base64
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 
@@ -32,8 +33,23 @@ import xbmcvfs
 ADDON = xbmcaddon.Addon()
 ADDON_ID = ADDON.getAddonInfo('id')
 ADDON_PATH = xbmcvfs.translatePath(ADDON.getAddonInfo('path'))
-RECEIVER = os.path.join(ADDON_PATH, 'airplay-receiver')
 PROFILE = xbmcvfs.translatePath(ADDON.getAddonInfo('profile'))
+
+
+def receiver_path():
+    """Where the daemon binary is.
+
+    A zip install keeps everything in one directory, but a distribution
+    package splits the add-on: the library and the daemon go to libdir while
+    addon.xml and this script -- which is what getAddonInfo('path') points at
+    -- go to datadir. special://xbmcbinaddons is the binary half, so try there
+    first and fall back to the one-directory layout.
+    """
+    binary = xbmcvfs.translatePath(
+        'special://xbmcbinaddons/{}/airplay-receiver'.format(ADDON_ID))
+    if os.path.exists(binary):
+        return binary
+    return os.path.join(ADDON_PATH, 'airplay-receiver')
 
 # Kept short on purpose: a unix socket path has about a hundred characters to
 # play with, fewer on macOS than on Linux, and the profile path is already
@@ -48,23 +64,62 @@ os.environ['AIRPLAY_SOCKET'] = SOCKET
 STREAM_URL = 'airplay://mirror'
 
 
-def kodi_rpc(method, params=None):
-    """Call Kodi's JSON-RPC over the loopback socket.
+# Whether to call JSON-RPC in-process rather than over the loopback socket.
+# Decided once at startup; see use_inprocess_rpc().
+_INPROC_RPC = [False]
 
-    Deliberately not xbmc.getCondVisibility() or other GUI-side helpers: those
-    take locks that deadlock against the player being torn down. The JSON-RPC
-    server runs on its own thread and is safe to call from here.
+
+def kodi_rpc(method, params=None):
+    """Call Kodi's JSON-RPC.
+
+    Over the loopback socket by preference. Deliberately not
+    xbmc.getCondVisibility() or other GUI-side helpers: those take locks that
+    deadlock against the player being torn down. The JSON-RPC server runs on
+    its own thread, so a call to it cannot wedge this one -- and if it ever
+    did, the timeout below ends it.
+
+    xbmc.executeJSONRPC() reaches the same handlers without the server, and is
+    the fallback for a user who has turned remote control off. It runs them on
+    this thread, which is why it is not the first choice.
     """
     request = {'jsonrpc': '2.0', 'id': 1, 'method': method}
     if params is not None:
         request['params'] = params
+    payload = json.dumps(request)
+
+    if _INPROC_RPC[0]:
+        try:
+            return json.loads(xbmc.executeJSONRPC(payload))
+        except ValueError as error:
+            log('json-rpc {} failed: {}'.format(method, error), xbmc.LOGDEBUG)
+            return None
+
     try:
         with socket.create_connection(('127.0.0.1', 9090), timeout=2) as sock:
-            sock.sendall(json.dumps(request).encode('utf-8'))
+            sock.sendall(payload.encode('utf-8'))
             return json.loads(sock.recv(65536).decode('utf-8', 'replace'))
     except (OSError, ValueError) as error:
         log('json-rpc {} failed: {}'.format(method, error), xbmc.LOGDEBUG)
         return None
+
+
+def use_inprocess_rpc():
+    """Decide how to reach JSON-RPC, once, before anything is playing.
+
+    The loopback server is off unless "allow remote control from applications
+    on this system" is on. Without this check, turning that off silently cost
+    play/pause, volume and the video-streaming progress reports.
+    """
+    try:
+        reply = json.loads(xbmc.executeJSONRPC(json.dumps(
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'Settings.GetSettingValue',
+             'params': {'setting': 'services.esenabled'}})))
+        enabled = (reply.get('result') or {}).get('value')
+    except (ValueError, AttributeError):
+        return
+    if enabled is False:
+        _INPROC_RPC[0] = True
+        log('remote control is off, so JSON-RPC will be called in-process')
 
 
 def active_player_id():
@@ -169,6 +224,7 @@ def receiver_settings():
             setting_bool('volumecontrol', True),
             setting_bool('mirroraudio', True),
             setting_bool('mirroring', True),
+            setting_bool('debuglog', False),
             setting_text('password'))
 
 
@@ -176,6 +232,9 @@ def receiver_env():
     env = os.environ.copy()
     xbmcvfs.mkdirs(PROFILE)
     env['AIRPLAY_SOCKET'] = SOCKET
+    # Kept out of the environment on purpose; see start_receiver().
+    env.pop('AIRPLAY_PASSWORD', None)
+    env['AIRPLAY_PASSWORD_STDIN'] = '1'
     env['AIRPLAY_HLS'] = '1' if hls_enabled() else '0'
     env['AIRPLAY_VOLUME'] = '1' if setting_bool('volumecontrol', True) else '0'
     env['AIRPLAY_MIRROR_AUDIO'] = '1' if setting_bool('mirroraudio', True) else '0'
@@ -186,15 +245,54 @@ def receiver_env():
     env['AIRPLAY_WIDTH'] = width
     env['AIRPLAY_HEIGHT'] = height
     env['AIRPLAY_REFRESH'] = refresh
-    env['AIRPLAY_PASSWORD'] = setting_text('password')
     # Advertise under the device's own name so it is recognisable in the
     # iOS AirPlay picker.
     env['AIRPLAY_NAME'] = friendly_name()
-    # Touch this file and restart Kodi to get UxPlay's full RTSP-level logging.
-    if os.path.exists(os.path.join(PROFILE, 'debug')):
+    if setting_bool('debuglog', False):
         env['AIRPLAY_DEBUG'] = '1'
         log('verbose receiver logging enabled')
     return env
+
+
+def start_receiver():
+    """Spawn the daemon, and hand it the password down its own stdin.
+
+    Not through the environment: that stays readable through /proc for as long
+    as the process runs, and the password is a secret the user typed. stderr
+    is folded into stdout so the daemon's diagnostics reach the Kodi log
+    instead of the system journal.
+    """
+    process = subprocess.Popen([receiver_path()], env=receiver_env(),
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT)
+    try:
+        process.stdin.write((setting_text('password') + '\n').encode('utf-8'))
+        process.stdin.flush()
+    except (OSError, ValueError):
+        pass  # it died on the way up; the restart path deals with it
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    return process
+
+
+def forget_devices():
+    """Drop every remembered pairing, so each device has to use a PIN again."""
+    path = os.path.join(PROFILE, 'paired-devices')
+    try:
+        os.remove(path)
+        removed = True
+    except FileNotFoundError:
+        removed = True
+    except OSError as error:
+        log('could not forget paired devices: {}'.format(error), xbmc.LOGERROR)
+        removed = False
+    if removed:
+        log('forgot every paired device')
+    xbmcgui.Dialog().notification(ADDON.getAddonInfo('name'),
+                                  ADDON.getLocalizedString(30022 if removed else 30023))
 
 
 # Current track, kept so artwork and tags can be applied together.
@@ -317,7 +415,8 @@ def stop_playback():
 # The sender's own remote control. Kodi is only rendering a stream, so pausing
 # it locally leaves the phone playing; these are what actually reach the phone.
 # Populated by EVENT DACP, cleared when the session ends.
-DACP = {'id': '', 'token': '', 'host': '', 'port': 0}
+# 'warned' is sticky across sessions: the tool is either installed or not.
+DACP = {'id': '', 'token': '', 'host': '', 'port': 0, 'warned': False}
 
 # Commands raised from Kodi's player callbacks, sent from the service thread:
 # the callbacks run on a Kodi thread and must not block on the network.
@@ -353,6 +452,15 @@ def dacp_resolve():
         out = subprocess.run(['avahi-browse', '-rtp', '_dacp._tcp'],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              timeout=5).stdout.decode('utf-8', 'replace')
+    except FileNotFoundError:
+        # Not on every Kodi target, and not on LibreELEC by default. The
+        # feature simply does not work without it, so say so once rather than
+        # leave a dead remote control looking like a bug.
+        if not DACP['warned']:
+            DACP['warned'] = True
+            log('avahi-browse is not installed, so the sender cannot be '
+                'remote-controlled from Kodi')
+        return False
     except (OSError, subprocess.SubprocessError) as error:
         log('dacp: browse failed: {}'.format(error), xbmc.LOGDEBUG)
         return False
@@ -443,12 +551,30 @@ class AirPlayPlayer(xbmc.Player):
 EVENTS = queue.Queue()
 
 
+# Set whenever there is something for the service loop to do, so it can sleep
+# between sessions instead of polling twenty times a second, without costing a
+# session anything at the moment it starts.
+WAKE = threading.Event()
+
+
 def read_events(process):
-    """Parse the daemon's event lines. No Kodi API calls belong in here."""
+    """Pass the daemon's output on: events to the service thread, the rest to
+    the log.
+
+    Its diagnostics go to stderr, which start_receiver() folds into this pipe.
+    Without that they end up in the journal, and the log a bug report carries
+    says nothing about what the receiver was doing. xbmc.log is safe from any
+    thread; no other Kodi API called from here would be.
+    """
     for raw in iter(process.stdout.readline, b''):
         line = raw.decode('utf-8', 'replace').strip()
-        if line:
+        if not line:
+            continue
+        if line.startswith('EVENT '):
             EVENTS.put(line)
+            WAKE.set()
+        else:
+            log('receiver: {}'.format(line))
 
 
 def handle_event(line):
@@ -549,6 +675,8 @@ def drain_events():
 
 
 class AirPlayMonitor(xbmc.Monitor):
+    """Notices setting changes so the receiver can be restarted to apply them,
+    and relays transport commands raised through NotifyAll()."""
 
     def onNotification(self, sender, method, data):
         """Relay a transport command raised by NotifyAll() to the sender.
@@ -565,9 +693,9 @@ class AirPlayMonitor(xbmc.Monitor):
             log('ignoring unknown notification "{}"'.format(method), xbmc.LOGDEBUG)
         elif DACP['token']:
             DACP_QUEUE.put(command)
+            WAKE.set()
         else:
             log('no sender to send "{}" to'.format(name), xbmc.LOGDEBUG)
-    """Notices setting changes so the receiver can be restarted to apply them."""
 
     def __init__(self):
         super().__init__()
@@ -582,13 +710,24 @@ class AirPlayMonitor(xbmc.Monitor):
             log('settings changed, restarting receiver')
 
 
+# How long to wait before restarting a daemon that keeps exiting, and how long
+# it has to stay up before it counts as healthy again.
+RESTART_BACKOFF_MIN = 1.0
+RESTART_BACKOFF_MAX = 60.0
+RESTART_STABLE_AFTER = 30.0
+
+
 def main():
     monitor = AirPlayMonitor()
+    use_inprocess_rpc()
     # Held for the life of the service: a Player that goes out of scope stops
     # receiving callbacks.
     player = AirPlayPlayer()
     process = None
     complained = False
+    backoff = 0.0
+    retry_at = 0.0
+    started_at = 0.0
 
     while not monitor.abortRequested():
         if monitor.restart_wanted and process is not None and process.poll() is None:
@@ -603,12 +742,27 @@ def main():
 
         if process is None or process.poll() is not None:
             if process is not None:
+                # A daemon that stayed up was working; only a quick exit means
+                # something is wrong, so only that should slow the next try.
+                if time.time() - started_at > RESTART_STABLE_AFTER:
+                    backoff = 0.0
                 log('receiver exited with {}, restarting'.format(process.returncode),
-                    xbmc.LOGWARNING)
+                    xbmc.LOGWARNING if backoff < RESTART_BACKOFF_MAX else xbmc.LOGDEBUG)
                 process = None
+
+            # Something that fails on every start -- no binary, a socket it
+            # cannot bind -- would otherwise be restarted twenty times a
+            # second, with a log line each time, for as long as Kodi runs.
+            if time.time() < retry_at:
+                if monitor.waitForAbort(0.2):
+                    break
+                continue
+            backoff = min(backoff * 2, RESTART_BACKOFF_MAX) if backoff else RESTART_BACKOFF_MIN
+            retry_at = time.time() + backoff
+
             try:
-                process = subprocess.Popen([RECEIVER], env=receiver_env(),
-                                           stdout=subprocess.PIPE)
+                process = start_receiver()
+                started_at = time.time()
                 complained = False
                 log('started receiver (pid {})'.format(process.pid))
                 threading.Thread(target=read_events, args=(process,), daemon=True).start()
@@ -618,16 +772,17 @@ def main():
                 if not complained:
                     log('could not start receiver: {}'.format(error), xbmc.LOGERROR)
                     complained = True
-                if monitor.waitForAbort(10):
-                    break
                 continue
 
         drain_events()
         service_pending_audio()
         drain_dacp()
 
-        if monitor.waitForAbort(0.05):
-            break
+        # Nothing to poll for between sessions: read_events and onNotification
+        # both wake this up the moment there is.
+        idle = not PENDING_AUDIO['due'] and not PLAYING['url'] and DACP_QUEUE.empty()
+        if WAKE.wait(0.5 if idle else 0.05):
+            WAKE.clear()
 
     if process is not None and process.poll() is None:
         log('stopping receiver')
@@ -639,4 +794,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # The settings screen runs this script again with an argument to act on a
+    # button; the service itself is started without one.
+    if len(sys.argv) > 1 and sys.argv[1] == 'forget':
+        forget_devices()
+    else:
+        main()

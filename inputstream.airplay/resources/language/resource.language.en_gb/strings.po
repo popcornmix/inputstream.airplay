@@ -81,5 +81,29 @@ msgid "Ask new devices to pair"
 msgstr ""
 
 msgctxt "#30017"
-msgid "Show a four digit code the first time a device connects, and remember it once entered so it is not asked again. Forget a device by removing its line from paired-devices in this add-on's data folder."
+msgid "Show a four digit code the first time a device connects, and remember it once entered so it is not asked again."
+msgstr ""
+
+msgctxt "#30018"
+msgid "Forget paired devices"
+msgstr ""
+
+msgctxt "#30019"
+msgid "Ask every device for the pairing code again the next time it connects."
+msgstr ""
+
+msgctxt "#30020"
+msgid "Verbose logging"
+msgstr ""
+
+msgctxt "#30021"
+msgid "Log every step of the AirPlay conversation, and each packet handed to the player. For diagnosing a problem; it makes the log very large."
+msgstr ""
+
+msgctxt "#30022"
+msgid "Paired devices forgotten"
+msgstr ""
+
+msgctxt "#30023"
+msgid "Could not forget paired devices"
 msgstr ""

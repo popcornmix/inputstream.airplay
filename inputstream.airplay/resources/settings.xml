@@ -18,6 +18,7 @@
           <default></default>
           <control type="edit" format="string">
             <heading>30005</heading>
+            <hidden>true</hidden>
           </control>
         </setting>
         <setting id="lowlatency" type="boolean" label="30007" help="30008">
@@ -50,6 +51,18 @@
         </setting>
         <setting id="pairing" type="boolean" label="30016" help="30017">
           <level>0</level>
+          <default>false</default>
+          <control type="toggle"/>
+        </setting>
+        <setting id="forgetdevices" type="action" label="30018" help="30019">
+          <level>0</level>
+          <data>RunScript(inputstream.airplay,forget)</data>
+          <control type="button" format="action">
+            <close>false</close>
+          </control>
+        </setting>
+        <setting id="debuglog" type="boolean" label="30020" help="30021">
+          <level>2</level>
           <default>false</default>
           <control type="toggle"/>
         </setting>

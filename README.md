@@ -79,18 +79,34 @@ A Debian package can be built with `dpkg-buildpackage`.
 
 ## Troubleshooting
 
-Create a file called `debug` in this add-on's profile directory
-(`userdata/addon_data/inputstream.airplay/`) and restart Kodi for the daemon's full protocol logging plus
-per-packet accounting. It is verbose enough to swamp a log, so turn it off
-again afterwards.
+Turn on **Verbose logging** in the add-on's settings for the daemon's full
+protocol logging plus per-packet accounting. It is verbose enough to swamp a
+log, so turn it off again afterwards. The daemon's output is folded into
+`kodi.log`, so a log attached to a bug report carries it.
 
 Useful lines: `session: X -> Y` on every mode change, `primed client with N
 buffered frames` when mirroring starts, and `consumer is behind` if Kodi is not
 keeping up.
 
+The daemon keeps its socket, cover art and list of paired devices in the
+add-on's profile directory (`userdata/addon_data/inputstream.airplay/`).
+
+Kodi's transport controls drive the phone over DACP, which needs
+`avahi-browse` on the box to find the sender; without it everything else still
+works and the log says so once. Pausing from the phone, and the progress
+reported back during app video, go through JSON-RPC -- over the loopback
+server if "allow remote control from applications on this system" is on, and
+in-process if it is not.
+
 ## Licence
 
-GPL-3.0-or-later.
+GPL-3.0-or-later, as installed.
+
+The two licences in this tree are not a contradiction. Every file written for
+this add-on is GPL-2.0-or-later, which is what its SPDX header says and what
+lets the code be reused in Kodi itself. `addon.xml` and `LICENSE.md` describe
+the add-on as built and distributed, which is GPL-3.0-or-later because of what
+it links.
 
 The build fetches UxPlay's protocol library, pinned by commit and checksum in
 `CMakeLists.txt`, and uses only `lib/` from it -- nothing is patched, so moving

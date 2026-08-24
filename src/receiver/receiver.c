@@ -82,7 +82,7 @@
 
 static raop_t* g_raop;
 static dnssd_t* g_dnssd;
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 
 /*
  * What the sender is doing right now. Behaviour differs in three ways --
@@ -120,6 +120,9 @@ static const char* mode_name(session_mode_t mode)
  * ending. */
 static bool g_mirror_to_video;
 
+/* The last track announced, so repeats of it can be ignored. */
+static char g_meta_previous[800];
+
 /*
  * When the sender handed us a video, so its first polls can be answered with
  * "still loading" rather than another stream's numbers.
@@ -133,6 +136,13 @@ static uint64_t g_video_start_ns;
  */
 #define APX_VIDEO_START_GRACE_NS (10ull * 1000000000ull)
 
+/*
+ * The session state, and g_mirror_to_video above it, are written from
+ * whichever UxPlay thread happens to notice the change -- httpd, mirror and
+ * RTP all do -- and read from the others. Every access is under g_lock; the
+ * _locked suffix on the helpers below is a reminder of which side of it they
+ * belong on.
+ */
 static struct
 {
   session_mode_t mode;
@@ -143,7 +153,7 @@ static struct
 /* Every mode change is logged: which mode the sender is in, and when it
  * changes, is the single most useful thing to know when a transition
  * misbehaves. */
-static void session_set_mode(session_mode_t mode)
+static void session_set_mode_locked(session_mode_t mode)
 {
   if (g_session.mode == mode)
     return;
@@ -259,6 +269,8 @@ static uint64_t g_last_video_send_ns;
  */
 #define APX_KEEPALIVE_AFTER_NS (100ull * 1000000ull)
 #define APX_WATCHDOG_TICK_US 50000
+/* How long to sleep between checks when there is no session at all. */
+#define APX_WATCHDOG_IDLE_US 500000
 
 /*
  * Whether a mirroring session may carry sound. Mirror audio only flows while
@@ -287,6 +299,13 @@ static bool g_verbose;
 
 static bool g_require_pairing;
 static char g_registry_path[256];
+
+/*
+ * Where cover art is written, taken from the socket's own directory. The
+ * add-on's profile is the one place both Kodi and the receiver are sure to be
+ * able to write; /run is root's on an ordinary distribution.
+ */
+static char g_art_dir[192];
 static uint64_t g_last_play_request_ns;
 
 /* Playback is driven by the Python service, not from here: Kodi's JSON-RPC
@@ -756,19 +775,23 @@ static void emit_event_arg(const char* event, const char* arg)
   pthread_mutex_unlock(&g_event_lock);
 }
 
-static void request_playback(void)
+/*
+ * Claim the right to ask Kodi for a player, returning the event that says so
+ * or NULL if a request is already outstanding. The caller emits it after
+ * dropping g_lock: writing an event blocks until the service reads it, and
+ * nothing else should have to wait behind that.
+ *
+ * The two events are distinguished because only an audio session needs
+ * holding back to see whether a video handoff follows. Mirroring deferred by
+ * the same grace period just buffers frames the sender is already producing,
+ * and every one of them becomes startup latency.
+ */
+static const char* request_playback_locked(void)
 {
   if (g_session.player_open)
-    return;
+    return NULL;
   g_session.player_open = true;
-
-  /*
-   * Distinguish the two, because only an audio session needs holding back to
-   * see whether a video handoff follows. Mirroring deferred by the same grace
-   * period just buffers frames the sender is already producing, and every one
-   * of them becomes startup latency.
-   */
-  emit_event(g_session.mode == MODE_AUDIO ? "PLAYAUDIO" : "PLAY");
+  return g_session.mode == MODE_AUDIO ? "PLAYAUDIO" : "PLAY";
 }
 
 /*
@@ -812,8 +835,9 @@ static void end_session(void)
   g_last_audio_ns = 0;
   g_audio_session_ns = 0;
   g_audio_session_frames = 0;
-  session_set_mode(MODE_IDLE);
+  session_set_mode_locked(MODE_IDLE);
   g_session.notify_video_ended = false;
+  g_meta_previous[0] = '\0';
   memset(&g_info, 0, sizeof(g_info));
   g_info.sample_rate = 44100;
   g_info.channels = 2;
@@ -871,7 +895,11 @@ static void cb_conn_destroy(void* cls)
    * stop callbacks, so the only mode still relying on this is audio, where a
    * RAOP teardown is all the library gives us.
    */
-  if (g_session.mode == MODE_AUDIO)
+  pthread_mutex_lock(&g_lock);
+  const bool audio = g_session.mode == MODE_AUDIO;
+  pthread_mutex_unlock(&g_lock);
+
+  if (audio)
     end_session();
 }
 
@@ -919,12 +947,11 @@ static void cb_video_reset(void* cls, reset_type_t reset_type)
 
 static int cb_video_set_codec(void* cls, video_codec_t codec)
 {
+  LOGI("mirroring codec: %s", codec == VIDEO_CODEC_H265 ? "hevc" : "h264");
+
   pthread_mutex_lock(&g_lock);
   g_info.video_codec = (codec == VIDEO_CODEC_H265) ? APX_VCODEC_HEVC : APX_VCODEC_H264;
   g_sent_streaminfo = false;
-  pthread_mutex_unlock(&g_lock);
-
-  LOGI("mirroring codec: %s", codec == VIDEO_CODEC_H265 ? "hevc" : "h264");
 
   /* Mirroring replaces any video streaming session that came before it.
    * Clearing the latch matters as much as the flags: it is what lets a new
@@ -939,11 +966,15 @@ static int cb_video_set_codec(void* cls, video_codec_t codec)
     g_session.notify_video_ended = true;
   /* A fresh mirror stream: any pending handover belonged to the last one. */
   g_mirror_to_video = false;
-  session_set_mode(MODE_MIRROR);
+  session_set_mode_locked(MODE_MIRROR);
   g_session.player_open = false;
 
   /* Mirroring is starting: ask Kodi to open the stream so it connects back. */
-  request_playback();
+  const char* play = request_playback_locked();
+  pthread_mutex_unlock(&g_lock);
+
+  if (play)
+    emit_event(play);
   return 0;
 }
 
@@ -1035,13 +1066,13 @@ static void cb_audio_get_format(void* cls, unsigned char* ct, unsigned short* sp
 
   /* usingScreen distinguishes mirroring audio from a plain music stream. */
   if (!*usingScreen && g_info.video_codec == APX_VCODEC_NONE)
-    session_set_mode(MODE_AUDIO);
-  const bool audio_only = g_session.mode == MODE_AUDIO;
+    session_set_mode_locked(MODE_AUDIO);
+  /* Nothing else will ask Kodi to open the stream for a music session. */
+  const char* play = g_session.mode == MODE_AUDIO ? request_playback_locked() : NULL;
   pthread_mutex_unlock(&g_lock);
 
-  /* Nothing else will ask Kodi to open the stream for a music session. */
-  if (audio_only)
-    request_playback();
+  if (play)
+    emit_event(play);
 }
 
 static void send_streaminfo_locked(void)
@@ -1131,10 +1162,10 @@ static void cb_video_process(void* cls, raop_ntp_t* ntp, video_decode_struct* da
 
   if (g_client < 0)
   {
-    const bool reoffer = should_reoffer_locked();
+    const char* play = should_reoffer_locked() ? request_playback_locked() : NULL;
     pthread_mutex_unlock(&g_lock);
-    if (reoffer)
-      request_playback();
+    if (play)
+      emit_event(play);
     return;
   }
 
@@ -1270,10 +1301,10 @@ static void cb_audio_process(void* cls, raop_ntp_t* ntp, audio_decode_struct* da
 
   if (g_client < 0)
   {
-    const bool reoffer = should_reoffer_locked();
+    const char* play = should_reoffer_locked() ? request_playback_locked() : NULL;
     pthread_mutex_unlock(&g_lock);
-    if (reoffer)
-      request_playback();
+    if (play)
+      emit_event(play);
     return;
   }
 
@@ -1420,13 +1451,13 @@ static void cb_audio_set_metadata(void* cls, const void* buffer, int buflen)
     return;
 
   /* The sender repeats the current track every few seconds; only pass on real
-   * changes so the service is not woken for nothing. */
-  static char previous[800];
+   * changes so the service is not woken for nothing. Cleared when a session
+   * ends, or replaying a track in the next one would be swallowed. */
   char current[800];
   snprintf(current, sizeof(current), "%s|%s|%s", title, artist, album);
-  if (!strcmp(current, previous))
+  if (!strcmp(current, g_meta_previous))
     return;
-  snprintf(previous, sizeof(previous), "%s", current);
+  snprintf(g_meta_previous, sizeof(g_meta_previous), "%s", current);
 
   char joined[800];
   int n = snprintf(joined, sizeof(joined), "%s\n%s\n%s", title, artist, album);
@@ -1453,8 +1484,8 @@ static void cb_audio_set_coverart(void* cls, const void* buffer, int buflen)
   /* Alternate between two names so Kodi reloads the image rather than serving
    * the previous track's artwork from its texture cache. */
   static int slot;
-  char path[128];
-  snprintf(path, sizeof(path), "/run/kodi-airplay-art%d.jpg", slot);
+  char path[256];
+  snprintf(path, sizeof(path), "%s/art%d.jpg", g_art_dir[0] ? g_art_dir : "/tmp", slot);
   slot ^= 1;
 
   FILE* f = fopen(path, "wb");
@@ -1520,10 +1551,20 @@ static void cb_display_pin(void* cls, char* pin)
  * A device that has just paired. Kept by public key, which is what the
  * library offers back on the next connection.
  */
+static bool cb_check_register(void* cls, const char* pk);
+
 static void cb_register_client(void* cls, const char* device_id, const char* pk, const char* name)
 {
   if (!pk || !*pk || !g_registry_path[0])
     return;
+
+  /* Senders re-pair for reasons of their own, and the file is only ever
+   * appended to, so without this it grows a duplicate line each time. */
+  if (cb_check_register(cls, pk))
+  {
+    LOGI("pairing: %s is already known", name && *name ? name : "device");
+    return;
+  }
 
   FILE* f = fopen(g_registry_path, "a");
   if (!f)
@@ -1653,11 +1694,13 @@ static void cb_on_video_play(void* cls, const char* location, const float start_
   snprintf(arg, sizeof(arg), "%s %.3f", encoded, start_position);
   free(encoded);
 
-  session_set_mode(MODE_VIDEO);
+  pthread_mutex_lock(&g_lock);
+  session_set_mode_locked(MODE_VIDEO);
   g_video_start_ns = now_ns();
   g_session.player_open = true; /* so a later teardown still asks for a stop */
-  emit_event_arg("HLS", arg);
+  pthread_mutex_unlock(&g_lock);
 
+  emit_event_arg("HLS", arg);
 }
 
 static void cb_on_video_scrub(void* cls, const float position)
@@ -1681,7 +1724,9 @@ static void cb_on_video_rate(void* cls, const float rate)
 static void cb_on_video_stop(void* cls)
 {
   LOGI("airplay video: stopped by sender");
-  session_set_mode(MODE_IDLE);
+  pthread_mutex_lock(&g_lock);
+  session_set_mode_locked(MODE_IDLE);
+  pthread_mutex_unlock(&g_lock);
   emit_event("HLSSTOP");
 }
 
@@ -1704,13 +1749,24 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
   float rate = 0.0f;
   bool playing = kodi_playback_state(&position, &duration, &rate);
 
+  /* One consistent look at the session; the polls come in every few hundred
+   * milliseconds from the httpd thread while others are changing it. */
+  pthread_mutex_lock(&g_lock);
+  const bool video_ended = g_session.notify_video_ended;
+  if (video_ended)
+  {
+    g_session.notify_video_ended = false;
+    session_set_mode_locked(MODE_IDLE);
+  }
+  const session_mode_t mode = g_session.mode;
+  const uint64_t video_start_ns = g_video_start_ns;
+  pthread_mutex_unlock(&g_lock);
+
   /* Something else has taken the player; report the video as finished so the
    * sender closes its session instead of restarting it. */
-  if (g_session.notify_video_ended)
+  if (video_ended)
   {
     LOGI("airplay video: telling the sender the video is finished");
-    g_session.notify_video_ended = false;
-    session_set_mode(MODE_IDLE);
     info->position = -1.0;
     info->duration = -1.0;
     info->rate = 0.0f;
@@ -1728,13 +1784,13 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
    * has none, a video does. That does mean a genuinely live video stays
    * "loading" until the grace period runs out.
    */
-  if (g_session.mode == MODE_VIDEO && duration <= 0.0 &&
-      now_ns() - g_video_start_ns < APX_VIDEO_START_GRACE_NS)
+  if (mode == MODE_VIDEO && duration <= 0.0 &&
+      now_ns() - video_start_ns < APX_VIDEO_START_GRACE_NS)
   {
     static uint64_t logged_for;
-    if (logged_for != g_video_start_ns)
+    if (logged_for != video_start_ns)
     {
-      logged_for = g_video_start_ns;
+      logged_for = video_start_ns;
       LOGI("airplay video: not playing yet, telling the sender we are still loading");
     }
 
@@ -1753,13 +1809,15 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
     return;
   }
 
-  if (!playing && g_session.mode == MODE_VIDEO)
+  if (!playing && mode == MODE_VIDEO)
   {
     /* Negative values are how the sender is told the video finished. */
     info->position = -1.0;
     info->duration = -1.0;
     info->rate = 0.0f;
-    session_set_mode(MODE_IDLE);
+    pthread_mutex_lock(&g_lock);
+    session_set_mode_locked(MODE_IDLE);
+    pthread_mutex_unlock(&g_lock);
     LOGI("airplay video: playback finished");
     return;
   }
@@ -1797,7 +1855,6 @@ static int make_listener(const char* path)
     return -1;
   }
 
-  unlink(path);
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   if (strlen(path) >= sizeof(addr.sun_path))
@@ -1808,6 +1865,29 @@ static int make_listener(const char* path)
     return -1;
   }
   snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+  /*
+   * A socket left behind by a hard kill has to go, but a live one means
+   * another receiver is already running: taking it over would leave two
+   * daemons advertising the same device and fighting over the add-on. Tell
+   * them apart by trying to connect to it.
+   */
+  if (access(path, F_OK) == 0)
+  {
+    int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (probe >= 0)
+    {
+      const bool live = connect(probe, (struct sockaddr*)&addr, sizeof(addr)) == 0;
+      close(probe);
+      if (live)
+      {
+        LOGI("another receiver is already listening on %s", path);
+        close(fd);
+        return -1;
+      }
+    }
+    unlink(path);
+  }
 
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
   {
@@ -1821,7 +1901,12 @@ static int make_listener(const char* path)
     close(fd);
     return -1;
   }
-  chmod(path, 0666);
+  /*
+   * Owner only. The stream on this socket is the mirror of someone's phone
+   * screen, and any process that connects also displaces the real client, so
+   * it is not something to leave open to every local user.
+   */
+  chmod(path, 0600);
   LOGI("listening on %s", path);
   return fd;
 }
@@ -1936,6 +2021,10 @@ int main(int argc, char** argv)
   if (!sock_path || !*sock_path)
     sock_path = APX_DEFAULT_SOCKET;
 
+  const char* slash = strrchr(sock_path, '/');
+  if (slash && (size_t)(slash - sock_path) < sizeof(g_art_dir))
+    snprintf(g_art_dir, sizeof(g_art_dir), "%.*s", (int)(slash - sock_path), sock_path);
+
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
   signal(SIGPIPE, SIG_IGN);
@@ -2031,14 +2120,29 @@ int main(int argc, char** argv)
    * streaming protocol stop mirroring and hand over a playlist instead, so it
    * changes behaviour for anyone who was happy with mirroring.
    */
-  /* Empty or unset means the receiver is open to anyone on the network, which
-   * is what it was before this was configurable. */
-  const char* password = getenv("AIRPLAY_PASSWORD");
-  if (password && *password)
+  /*
+   * Empty or unset means the receiver is open to anyone on the network, which
+   * is what it was before this was configurable.
+   *
+   * The add-on sends the password on stdin rather than in the environment: a
+   * process environment stays readable through /proc for as long as it runs,
+   * and this is a secret someone typed. AIRPLAY_PASSWORD remains for running
+   * the receiver by hand.
+   */
+  if (getenv("AIRPLAY_PASSWORD_STDIN"))
   {
-    snprintf(g_password, sizeof(g_password), "%s", password);
-    LOGI("client access password set");
+    if (fgets(g_password, sizeof(g_password), stdin))
+      g_password[strcspn(g_password, "\r\n")] = '\0';
+    fclose(stdin);
   }
+  else
+  {
+    const char* password = getenv("AIRPLAY_PASSWORD");
+    if (password)
+      snprintf(g_password, sizeof(g_password), "%s", password);
+  }
+  if (g_password[0])
+    LOGI("client access password set");
 
   const char* reg = getenv("AIRPLAY_REGISTRY");
   if (reg && *reg)
@@ -2138,12 +2242,11 @@ int main(int argc, char** argv)
        (unsigned)raop_port, (unsigned long long)dnssd_get_airplay_features(g_dnssd),
        hls_enabled ? "enabled" : "disabled");
 
-  unsigned tick = 0;
+  uint64_t last_slow_ns = 0;
   while (g_running)
   {
-    usleep(APX_WATCHDOG_TICK_US);
-
     pthread_mutex_lock(&g_lock);
+    const bool busy = g_session.mode != MODE_IDLE || g_client >= 0;
     if (g_session.mode == MODE_MIRROR && g_client >= 0 && g_primed && g_have_base &&
         g_last_video_send_ns && now_ns() - g_last_video_send_ns > APX_KEEPALIVE_AFTER_NS)
     {
@@ -2151,10 +2254,18 @@ int main(int argc, char** argv)
     }
     pthread_mutex_unlock(&g_lock);
 
+    /*
+     * The keepalive has to be checked often, but only while there is a stream
+     * to keep alive. With no session there is nothing here worth waking a
+     * sleeping box twenty times a second for.
+     */
+    usleep(busy ? APX_WATCHDOG_TICK_US : APX_WATCHDOG_IDLE_US);
+
     /* Everything below only needs looking at about once a second. */
-    if (++tick < 1000000 / APX_WATCHDOG_TICK_US)
+    const uint64_t now = now_ns();
+    if (now - last_slow_ns < 1000000000ull)
       continue;
-    tick = 0;
+    last_slow_ns = now;
 
     pthread_mutex_lock(&g_lock);
 
