@@ -2179,17 +2179,23 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
 
   /*
    * No video session at all: the last one finished, or the sender is
-   * mirroring. Say so, rather than describing a video that is not there.
+   * mirroring. Say the information is not available, rather than describing a
+   * video that is not there -- the answer below is what a loaded, ready video
+   * looks like, and giving it when there is none leaves the sender showing
+   * itself as playing, and answering a press of play with a resume for a
+   * video Kodi does not have.
    *
-   * The answer below is what a loaded, ready video looks like, and giving it
-   * when there is none leaves the sender showing that it is playing while
-   * nothing is -- and, because it believes a video is already loaded, asking
-   * it to play again only sends a resume for a video Kodi does not have.
+   * Position alone, deliberately. The library reads a duration of -1 as "the
+   * video has finished", and answers it by disconnecting the sender and
+   * shutting the HLS session down -- which is right once, at the end of a
+   * video, and an endless reconnect loop when it is the standing answer to
+   * every poll. A position of -1 on its own is the "not available" reply,
+   * which it passes over quietly.
    */
   if (mode != MODE_VIDEO)
   {
     info->position = -1.0;
-    info->duration = -1.0;
+    info->duration = 0.0;
     info->rate = 0.0f;
     return;
   }
