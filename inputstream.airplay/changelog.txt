@@ -1,3 +1,14 @@
+v0.1.6
+- Accepts H.265 mirroring, which is what a phone sends to a 4K display. Without
+  it mirroring failed outright on those.
+- The receiver writes to the add-on from a thread of its own, so a slow
+  consumer no longer stalls volume, progress and format negotiation.
+- Video handed over from a browser starts where the phone was, plays rather
+  than sitting paused, and is reported honestly while it is still opening.
+- Stopping playback locally is noticed, so the phone stops showing a video
+  Kodi is not playing.
+- Remote-control commands no longer block the service loop.
+
 v0.1.5
 - Fixes a framing error that could take Kodi down with it.
 - The socket moves to Kodi's temp directory, which fits inside the length

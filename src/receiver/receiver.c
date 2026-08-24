@@ -220,12 +220,11 @@ static bool g_have_base;
 static uint8_t g_params[4096];
 static size_t g_params_len;
 
-/* Most recent IDR access unit. A client attaching mid-session (which is the
- * normal case, since Kodi only opens the stream after we ask it to) would
- * otherwise start at a non-keyframe and the decoder could never produce a
- * picture until the sender happened to emit another IDR. */
 /*
- * Frames held from the most recent keyframe onwards. Replaying just the
+ * Frames held from the most recent keyframe onwards. A client attaching
+ * mid-session -- the normal case, since Kodi only opens the stream after we
+ * ask it to -- would otherwise start at a non-keyframe and never produce a
+ * picture until the sender happened to emit another IDR. Replaying just the
  * keyframe and then resuming live skips every delta in between -- which are
  * precisely the references the live frames are built on -- so the picture
  * breaks up and the timeline gains a hole as long as the keyframe is old.
@@ -281,12 +280,12 @@ static uint64_t g_frames_out;  /* forwarded to the add-on */
 static uint64_t g_audio_out;   /* audio frames forwarded */
 static uint64_t g_audio_in;    /* audio frames handed to us by lib/ */
 static uint64_t g_last_video_ntp;
-static uint64_t g_dropped_msgs; /* guarded by g_out_lock */
+/* Written by whichever thread drops a message, read by the verbose log on
+ * another. Atomic because it is genuinely shared, not because the count
+ * needs to be exact. */
+static _Atomic uint64_t g_dropped_msgs;
 
-/* A session is either screen mirroring or plain audio streaming. The sender
- * tells us which via usingScreen on the audio SETUP. Audio-only sessions have
- * no video stream at all, so they must not wait for a keyframe. */
-
+/* Whether the sender may hand over a video to stream instead of mirroring. */
 static bool g_hls_enabled;
 
 /* Client-access password, empty for none. Held for the life of the process
@@ -332,15 +331,15 @@ static bool g_mirror_audio = true;
  */
 static bool g_offer_mirroring = true;
 
+/* Extra logging, for working out why a session is not behaving. */
+static bool g_verbose;
+
 /*
  * Pairing. With this on the sender is shown a four digit code the first time
  * it connects, and once it has been entered the device is remembered and is
  * not asked again -- which is how an Apple TV behaves. The library only
  * enforces the remembered list when a PIN is in use, so the two go together.
  */
-/* Extra logging, for working out why a session is not behaving. */
-static bool g_verbose;
-
 static bool g_require_pairing;
 static char g_registry_path[256];
 
@@ -495,6 +494,8 @@ static bool g_client_connected;
  */
 static uint32_t g_client_gen;
 
+static void note_dropped(void);
+
 /* Caller holds g_out_lock. */
 static void out_push_locked(struct out_msg* msg)
 {
@@ -556,6 +557,19 @@ static bool send_msg_locked(uint32_t type, uint32_t flags, uint64_t pts_ns, cons
 {
   if (!g_client_connected)
     return false;
+
+  /*
+   * Bigger than the add-on will accept. It treats an oversized length as lost
+   * framing and ends the stream, which is the right answer to a corrupt header
+   * and the wrong one to a single outsized frame -- so drop the frame here
+   * instead, the way any other frame the consumer cannot take is dropped.
+   */
+  if (size > APX_MAX_PAYLOAD)
+  {
+    LOGI("dropping a %u byte message, over the %u byte limit", size, APX_MAX_PAYLOAD);
+    note_dropped();
+    return false;
+  }
 
   const bool priming = g_priming;
 
@@ -848,7 +862,10 @@ static bool cache_parameter_sets(const uint8_t* data, size_t len, bool is_h265)
 /* Does this access unit already carry SPS/PPS (H.264) or VPS/SPS/PPS (HEVC)? */
 static bool au_has_parameter_sets(const uint8_t* data, size_t len, bool is_h265)
 {
-  for (size_t i = 0; i + 4 < len; i++)
+  /* i + 3 < len, matching cache_parameter_sets: a three byte start code plus
+   * one byte of NAL header is the shortest thing worth looking at, and the
+   * other bound quietly skipped one that ended four bytes from the end. */
+  for (size_t i = 0; i + 3 < len; i++)
   {
     if (data[i] != 0 || data[i + 1] != 0)
       continue;
@@ -881,7 +898,8 @@ static bool au_has_parameter_sets(const uint8_t* data, size_t len, bool is_h265)
 /* Does this Annex-B access unit carry an IDR (H.264 type 5, HEVC 16-21)? */
 static bool au_has_keyframe(const uint8_t* data, size_t len, bool is_h265)
 {
-  for (size_t i = 0; i + 4 < len; i++)
+  /* i + 3 < len; see the note in au_has_parameter_sets. */
+  for (size_t i = 0; i + 3 < len; i++)
   {
     if (data[i] != 0 || data[i + 1] != 0)
       continue;
@@ -1158,9 +1176,21 @@ static void cb_conn_init(void* cls)
  * Wind the session up: tell the add-on the stream is over and forget
  * everything derived from it, so the next session starts from scratch.
  */
-static void end_session(void)
+/*
+ * only_if_mirroring is for the watchdog, which decides to end a mirroring
+ * session and then has to drop g_lock before saying so. A video handoff can
+ * arrive in that window and has already set MODE_VIDEO; tearing the session
+ * down then would undo the handoff the grace period exists to allow. Checked
+ * here, under the same lock the mode is set with, so there is no window left.
+ */
+static void end_session_maybe(bool only_if_mirroring)
 {
   pthread_mutex_lock(&g_lock);
+  if (only_if_mirroring && g_session.mode != MODE_MIRROR)
+  {
+    pthread_mutex_unlock(&g_lock);
+    return;
+  }
   send_msg_locked(APX_MSG_EOS, 0, 0, NULL, 0);
   g_have_base = false;
   g_params_len = 0;
@@ -1191,6 +1221,11 @@ static void end_session(void)
   pthread_mutex_unlock(&g_lock);
 
   emit_event("STOP");
+}
+
+static void end_session(void)
+{
+  end_session_maybe(false);
 }
 
 /*
@@ -1442,6 +1477,14 @@ static void send_streaminfo_locked(void)
   if (g_session.mode != MODE_AUDIO && !g_params_len)
     return;
 
+  if (g_params_len > APX_MAX_VIDEO_EXTRADATA)
+  {
+    /* Never seen: real H.264 SPS+PPS and HEVC VPS+SPS+PPS are far smaller. If
+     * it ever happens the decoder gets half a parameter set, which is not
+     * something anyone would work out from the symptom alone. */
+    LOGI("parameter sets are %zu bytes, only %d will fit -- the decoder may not open",
+         g_params_len, APX_MAX_VIDEO_EXTRADATA);
+  }
   g_info.video_extradata_size =
       (uint32_t)(g_params_len > APX_MAX_VIDEO_EXTRADATA ? APX_MAX_VIDEO_EXTRADATA : g_params_len);
   memcpy(g_info.video_extradata, g_params, g_info.video_extradata_size);
@@ -1505,9 +1548,10 @@ static void cb_video_process(void* cls, raop_ntp_t* ntp, video_decode_struct* da
    * resync can then always replay from the last keyframe. iOS stops sending
    * entirely when the screen is static, so waiting for a fresh keyframe after
    * a pause can wait for ever. */
-  if (au_has_keyframe(data->data, (size_t)data->data_len, data->is_h265))
+  const bool is_keyframe = au_has_keyframe(data->data, (size_t)data->data_len, data->is_h265);
+  if (is_keyframe)
     gop_clear(); /* a keyframe makes everything before it redundant */
-  if (g_gop_count || au_has_keyframe(data->data, (size_t)data->data_len, data->is_h265))
+  if (g_gop_count || is_keyframe)
     gop_append(data->data, (size_t)data->data_len, data->ntp_time_local);
 
   if (g_verbose && (g_frames_in <= 5 || (g_frames_in % 120) == 0))
@@ -2187,18 +2231,13 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
     }
 
     /*
-     * Zero position and duration, because they are not known yet -- but ready
-     * and keeping up, because the alternative is not survivable. Saying the
-     * buffer is empty and we are not ready is answered by the sender pausing:
-     * every log of a cast starting paused has the pause arriving less than a
-     * tenth of a second after this reply. UxPlay, which senders are happy
-     * with, reports ready_to_play and playback_likely_to_keep_up as true
-     * unconditionally and never claims otherwise.
+     * Ready and keeping up, because saying otherwise is not survivable: a
+     * sender told the buffer is empty and the receiver not ready answers by
+     * pausing. UxPlay, which senders are happy with, reports ready_to_play and
+     * playback_likely_to_keep_up as true unconditionally and never claims
+     * otherwise. The rate says playing, because a handover is a request to
+     * play and this is the gap before Kodi has the stream open, not a pause.
      *
-     * The rate says playing: a handover is a request to play, and this is the
-     * gap before Kodi has the stream open, not a pause.
-     */
-    /*
      * Say the information is not available, which is what a position of -1
      * means to the library: it answers the poll without a body rather than
      * describing the video. Making numbers up instead is what we did before,
@@ -2530,20 +2569,24 @@ int main(int argc, char** argv)
     return 1;
 
   pthread_t th;
-  pthread_create(&th, NULL, accept_thread, &listener);
+  if (pthread_create(&th, NULL, accept_thread, &listener) != 0)
+  {
+    LOGI("could not start the accept thread");
+    goto fail;
+  }
 
   pthread_t writer;
   if (pthread_create(&writer, NULL, writer_thread, NULL) != 0)
   {
     LOGI("could not start the writer thread");
-    return 1;
+    goto fail;
   }
 
   char mac[6];
   if (get_mac(getenv("AIRPLAY_IFACE"), mac) != 0)
   {
     LOGI("could not determine a MAC address");
-    return 1;
+    goto fail;
   }
 
   int dnssd_error = 0;
@@ -2551,7 +2594,7 @@ int main(int argc, char** argv)
   if (!g_dnssd || dnssd_error)
   {
     LOGI("dnssd_init failed: %d", dnssd_error);
-    return 1;
+    goto fail;
   }
 
   raop_callbacks_t cbs;
@@ -2594,7 +2637,7 @@ int main(int argc, char** argv)
   if (!g_raop)
   {
     LOGI("raop_init failed");
-    return 1;
+    goto fail;
   }
 
   raop_set_log_callback(g_raop, cb_log, NULL);
@@ -2611,14 +2654,9 @@ int main(int argc, char** argv)
   if (raop_init2(g_raop, 1 /* nohold */, mac_str, ""))
   {
     LOGI("raop_init2 failed");
-    return 1;
+    goto fail;
   }
 
-  /*
-   * Off unless asked for. With it enabled, apps that support the video
-   * streaming protocol stop mirroring and hand over a playlist instead, so it
-   * changes behaviour for anyone who was happy with mirroring.
-   */
   /*
    * Empty or unset means the receiver is open to anyone on the network, which
    * is what it was before this was configurable.
@@ -2666,6 +2704,11 @@ int main(int argc, char** argv)
   const char* vol = getenv("AIRPLAY_VOLUME");
   g_volume_control = vol && *vol && *vol != '0';
 
+  /*
+   * Off unless asked for. With it enabled, apps that support the video
+   * streaming protocol stop mirroring and hand over a playlist instead, so it
+   * changes behaviour for anyone who was happy with mirroring.
+   */
   const char* hls = getenv("AIRPLAY_HLS");
   const bool hls_enabled = hls && *hls && *hls != '0';
   g_hls_enabled = hls_enabled;
@@ -2718,11 +2761,6 @@ int main(int argc, char** argv)
     LOGI("screen mirroring not offered");
   }
 
-  /*
-   * Tell the sender what it is actually drawing on. Left unset, the library
-   * claims 1920x1080 at 60Hz, and a sender told the wrong refresh rate or
-   * size encodes for a screen that is not there.
-   */
   if (g_require_pairing)
   {
     /* Anything below 10000 means "make up a new one each time". */
@@ -2730,6 +2768,11 @@ int main(int argc, char** argv)
     LOGI("pairing required; known devices in %s", g_registry_path);
   }
 
+  /*
+   * Tell the sender what it is actually drawing on. Left unset, the library
+   * claims 1920x1080 at 60Hz, and a sender told the wrong refresh rate or
+   * size encodes for a screen that is not there.
+   */
   const char* w = getenv("AIRPLAY_WIDTH");
   const char* h = getenv("AIRPLAY_HEIGHT");
   const char* hz = getenv("AIRPLAY_REFRESH");
@@ -2780,7 +2823,7 @@ int main(int argc, char** argv)
     if (stop_now)
     {
       LOGI("mirroring stopped and no video followed, ending the session");
-      end_session();
+      end_session_maybe(true);
     }
 
     /*
@@ -2818,7 +2861,7 @@ int main(int argc, char** argv)
      */
     const bool unstartable = g_session.mode == MODE_MIRROR && !g_client_connected &&
                              !g_session.player_open && g_unstartable_since_ns &&
-                             now_ns() - g_unstartable_since_ns > APX_UNSTARTABLE_GRACE_NS;
+                             now - g_unstartable_since_ns > APX_UNSTARTABLE_GRACE_NS;
     if (unstartable)
     {
       g_unstartable_since_ns = 0;
@@ -2853,4 +2896,11 @@ int main(int argc, char** argv)
   close(listener);
   unlink(sock_path);
   return 0;
+
+fail:
+  /* The socket exists from here on, and a later start would find it and have
+   * to work out for itself that nobody is behind it. Take it away instead. */
+  close(listener);
+  unlink(sock_path);
+  return 1;
 }

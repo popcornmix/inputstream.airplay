@@ -13,10 +13,10 @@
 
 #include "InputStreamAirPlay.h"
 
-#include <kodi/Filesystem.h>
-
 #include <cerrno>
 #include <cstring>
+
+#include <kodi/Filesystem.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -43,6 +43,25 @@ CInputStreamAirPlay::CInputStreamAirPlay(const kodi::addon::IInstanceInfo& insta
 CInputStreamAirPlay::~CInputStreamAirPlay()
 {
   Close();
+}
+
+bool CInputStreamAirPlay::SkipPayload(uint32_t size)
+{
+  if (!size)
+    return true;
+
+  /* In bounded chunks rather than one allocation the size of the message: the
+   * caller has already rejected anything over APX_MAX_PAYLOAD, but there is no
+   * reason to take a megabyte of scratch space to throw a megabyte away. */
+  uint8_t scratch[8192];
+  while (size)
+  {
+    const uint32_t chunk = size < sizeof(scratch) ? size : (uint32_t)sizeof(scratch);
+    if (!ReadExact(scratch, chunk, 2000))
+      return false;
+    size -= chunk;
+  }
+  return true;
 }
 
 bool CInputStreamAirPlay::ReadExact(void* buf, size_t len, int timeoutMs)
@@ -147,8 +166,8 @@ bool CInputStreamAirPlay::Open(const kodi::addon::InputstreamProperty& props)
 
   if (!Connect())
   {
-    kodi::Log(ADDON_LOG_ERROR, "airplay: cannot reach the receiver at %s: %s",
-              m_socketPath.c_str(), std::strerror(errno));
+    kodi::Log(ADDON_LOG_ERROR, "airplay: cannot reach the receiver at %s: %s", m_socketPath.c_str(),
+              std::strerror(errno));
     return false;
   }
 
@@ -166,9 +185,10 @@ bool CInputStreamAirPlay::Open(const kodi::addon::InputstreamProperty& props)
         break;
       continue;
     }
-    if (hdr.magic != APX_MAGIC)
+    if (hdr.magic != APX_MAGIC || hdr.size > APX_MAX_PAYLOAD)
     {
-      kodi::Log(ADDON_LOG_ERROR, "airplay: framing error, giving up");
+      kodi::Log(ADDON_LOG_ERROR, "airplay: framing error (magic %08x, size %u), giving up",
+                hdr.magic, hdr.size);
       break;
     }
     if (hdr.type == APX_MSG_STREAMINFO && hdr.size == sizeof(m_info))
@@ -179,12 +199,8 @@ bool CInputStreamAirPlay::Open(const kodi::addon::InputstreamProperty& props)
       break;
     }
     /* Anything arriving before the stream info is not useful yet. */
-    if (hdr.size)
-    {
-      std::vector<uint8_t> skip(hdr.size);
-      if (!ReadExact(skip.data(), hdr.size, 2000))
-        break;
-    }
+    if (!SkipPayload(hdr.size))
+      break;
   }
 
   if (!m_haveInfo)
@@ -363,7 +379,15 @@ DEMUX_PACKET* CInputStreamAirPlay::DemuxRead()
   if (hdr.type == APX_MSG_PROGRESS)
   {
     apx_progress progress{};
-    if (hdr.size == sizeof(progress) && ReadExact(&progress, sizeof(progress), 2000))
+    if (hdr.size != sizeof(progress))
+    {
+      /* Not what this build expects. Take it off the socket anyway: leaving it
+       * there turns the next header read into payload bytes, and the stream
+       * ends as a framing error rather than one ignored message. */
+      SkipPayload(hdr.size);
+      return AllocateDemuxPacket(0);
+    }
+    if (ReadExact(&progress, sizeof(progress), 2000))
     {
       m_positionMs = progress.position_ms;
       m_durationMs = progress.duration_ms;
@@ -374,8 +398,13 @@ DEMUX_PACKET* CInputStreamAirPlay::DemuxRead()
 
   if (hdr.type == APX_MSG_STREAMINFO)
   {
+    if (hdr.size != sizeof(m_info))
+    {
+      SkipPayload(hdr.size); /* see the note in the progress branch */
+      return AllocateDemuxPacket(0);
+    }
     /* A mid-session format change: pick up the new values and tell Kodi. */
-    if (hdr.size == sizeof(m_info) && ReadExact(&m_info, sizeof(m_info), 2000))
+    if (ReadExact(&m_info, sizeof(m_info), 2000))
     {
       const bool hadAudio = m_hasAudio;
       m_hasAudio = m_info.audio_ct != APX_ACT_NONE;
@@ -392,11 +421,7 @@ DEMUX_PACKET* CInputStreamAirPlay::DemuxRead()
 
   if (hdr.type != APX_MSG_VIDEO && hdr.type != APX_MSG_AUDIO)
   {
-    if (hdr.size)
-    {
-      std::vector<uint8_t> skip(hdr.size);
-      ReadExact(skip.data(), hdr.size, 2000);
-    }
+    SkipPayload(hdr.size);
     return AllocateDemuxPacket(0);
   }
 
@@ -418,8 +443,8 @@ DEMUX_PACKET* CInputStreamAirPlay::DemuxRead()
               static_cast<double>(hdr.pts_ns) / 1e6);
 
   pkt->iSize = static_cast<int>(hdr.size);
-  pkt->iStreamId =
-      (hdr.type == APX_MSG_VIDEO) ? static_cast<int>(STREAM_ID_VIDEO) : static_cast<int>(STREAM_ID_AUDIO);
+  pkt->iStreamId = (hdr.type == APX_MSG_VIDEO) ? static_cast<int>(STREAM_ID_VIDEO)
+                                               : static_cast<int>(STREAM_ID_AUDIO);
 
   /* Receiver timestamps are nanoseconds on its local clock; Kodi wants
    * microseconds. Both streams share the clock, so A/V stay aligned. */

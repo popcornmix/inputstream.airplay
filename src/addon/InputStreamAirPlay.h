@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "../proto.h"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -15,8 +17,6 @@
 
 #include <kodi/AddonBase.h>
 #include <kodi/addon-instance/Inputstream.h>
-
-#include "../proto.h"
 
 class ATTR_DLL_LOCAL CInputStreamAirPlay : public kodi::addon::CInstanceInputStream
 {
@@ -45,6 +45,9 @@ public:
 private:
   /* Reads exactly len bytes, or returns false on timeout/error. */
   bool ReadExact(void* buf, size_t len, int timeoutMs);
+  /* Read and discard a payload this build has no use for, so the next header
+   * read starts on a header. Sizes are capped before this is reached. */
+  bool SkipPayload(uint32_t size);
   bool Connect();
   bool TryReconnect();
   std::string VideoCodecName() const;

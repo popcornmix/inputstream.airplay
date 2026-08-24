@@ -9,14 +9,7 @@ Section: libs
 Package: kodi-inputstream-airplay
 Section: libs
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}, kodi
 Description: AirPlay receiver for Kodi
  Receives AirPlay screen mirroring, app video and audio, and plays them
  through Kodi's own pipeline.
-
-Package: kodi-inputstream-airplay-dbg
-Section: debug
-Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: debug symbols for AirPlay receiver for Kodi
- debug symbols for AirPlay receiver for Kodi

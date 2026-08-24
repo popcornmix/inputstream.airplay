@@ -6,7 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Kodi REQUIRED)
+# Not used directly here. UxPlay's lib/CMakeLists.txt calls pkg_check_modules
+# for libplist, and finding PkgConfig is the including project's job.
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 
 # "/.." so <kodi/...> resolves; the same shape the other binary add-ons use.
 include_directories(${KODI_INCLUDE_DIR}/..
@@ -106,7 +109,10 @@ target_include_directories(airplay-receiver PRIVATE
                            ${uxplay_SOURCE_DIR}/lib
                            ${uxplay_SOURCE_DIR}/lib/mdnsd
                            ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(airplay-receiver PRIVATE airplay pthread)  # libm arrives with playfair
+# Threads::Threads rather than a bare pthread: it also puts -pthread on the
+# compile line, which is what the toolchain actually wants. libm arrives with
+# playfair.
+target_link_libraries(airplay-receiver PRIVATE airplay Threads::Threads)
 
 # ---------------------------------------------------------------------------
 # Kodi add-on

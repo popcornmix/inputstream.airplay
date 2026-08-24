@@ -94,7 +94,20 @@ def kodi_rpc(method, params=None):
     try:
         with socket.create_connection(('127.0.0.1', 9090), timeout=2) as sock:
             sock.sendall(payload.encode('utf-8'))
-            return json.loads(sock.recv(65536).decode('utf-8', 'replace'))
+            # Read until it parses. One recv() is usually the whole reply, but
+            # nothing guarantees it, and a reply split across two segments
+            # would otherwise look like malformed JSON and be thrown away.
+            raw = b''
+            while len(raw) < 1024 * 1024:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
+                try:
+                    return json.loads(raw.decode('utf-8', 'replace'))
+                except ValueError:
+                    continue
+            raise ValueError('incomplete reply ({} bytes)'.format(len(raw)))
     except (OSError, ValueError) as error:
         log('json-rpc {} failed: {}'.format(method, error), xbmc.LOGDEBUG)
         return None
@@ -508,7 +521,9 @@ def stop_playback():
 # it locally leaves the phone playing; these are what actually reach the phone.
 # Populated by EVENT DACP, cleared when the session ends.
 # 'warned' is sticky across sessions: the tool is either installed or not.
-DACP = {'id': '', 'token': '', 'host': '', 'port': 0, 'warned': False, 'retry_at': 0.0}
+# 'port' is a string: it arrives that way from avahi and is only ever
+# interpolated into a URL.
+DACP = {'id': '', 'token': '', 'host': '', 'port': '', 'warned': False, 'retry_at': 0.0}
 
 # How long to leave it before looking again for a sender that was not there.
 DACP_RETRY_GRACE = 10.0
@@ -706,7 +721,7 @@ def handle_event(line):
     elif line == 'EVENT STOP':
         PENDING_AUDIO['due'] = 0.0
         TRACK.update(title='', artist='', album='', art='')
-        DACP.update(id='', token='', host='', port=0, retry_at=0.0)
+        DACP.update(id='', token='', host='', port='', retry_at=0.0)
         stop_playback()
     elif line.startswith('EVENT DACP '):
         payload = line[11:].split(' ')
@@ -854,6 +869,11 @@ def main():
     while not monitor.abortRequested():
         if monitor.restart_wanted and process is not None and process.poll() is None:
             monitor.restart_wanted = False
+            # Asked for, not a failure: the backoff exists to slow down a
+            # receiver that keeps dying, and letting settings changes wind it
+            # up delays recovery from a real crash later.
+            backoff = 0.0
+            retry_at = 0.0
             stop_playback()
             process.terminate()
             try:

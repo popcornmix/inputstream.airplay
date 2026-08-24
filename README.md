@@ -32,6 +32,8 @@ input, and a fault there stops a helper rather than taking Kodi down.
 | Offer screen mirroring | on | Mainly a diagnostic. A phone will not offer the device at all for photos without it. |
 | Start mirroring at the live edge | off | Needs a Kodi that supports it; ignored otherwise. |
 | How far behind the phone to stay | 100 ms | Smaller follows the phone more closely but leaves less room for sound to arrive unevenly. |
+| Forget paired devices | -- | Asks every device for the pairing code again the next time it connects. |
+| Verbose logging | off | The whole AirPlay conversation and each packet handed to the player. For diagnosing a problem; see Troubleshooting. |
 
 ## Latency, and the Kodi patches
 
