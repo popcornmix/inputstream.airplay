@@ -457,7 +457,10 @@ def stop_playback():
 # it locally leaves the phone playing; these are what actually reach the phone.
 # Populated by EVENT DACP, cleared when the session ends.
 # 'warned' is sticky across sessions: the tool is either installed or not.
-DACP = {'id': '', 'token': '', 'host': '', 'port': 0, 'warned': False}
+DACP = {'id': '', 'token': '', 'host': '', 'port': 0, 'warned': False, 'retry_at': 0.0}
+
+# How long to leave it before looking again for a sender that was not there.
+DACP_RETRY_GRACE = 10.0
 
 # Commands raised from Kodi's player callbacks, sent from the service thread:
 # the callbacks run on a Kodi thread and must not block on the network.
@@ -488,6 +491,10 @@ def dacp_resolve():
         return True
     if not DACP['id']:
         return False
+    # A sender that has gone is not going to be found by asking again straight
+    # away, and each attempt costs five seconds.
+    if time.time() < DACP['retry_at']:
+        return False
     wanted = 'iTunes_Ctrl_{}'.format(DACP['id'])
     try:
         out = subprocess.run(['avahi-browse', '-rtp', '_dacp._tcp'],
@@ -514,6 +521,7 @@ def dacp_resolve():
         log('dacp: sender remote at {}:{}'.format(DACP['host'], DACP['port']))
         return True
     log('dacp: {} not found on the network'.format(wanted), xbmc.LOGDEBUG)
+    DACP['retry_at'] = time.time() + DACP_RETRY_GRACE
     return False
 
 
@@ -534,13 +542,25 @@ def dacp_send(command):
         DACP['host'], DACP['port'] = '', 0
 
 
-def drain_dacp():
-    while True:
+def dacp_worker(monitor):
+    """Send queued commands to the sender, on a thread of its own.
+
+    Both halves of this can block for seconds: resolving the endpoint shells
+    out to avahi-browse, which waits five seconds to decide nothing is there,
+    and the request itself waits three. Doing that on the service loop stopped
+    it draining the receiver's events for as long as it took -- long enough,
+    with a sender that had gone away, for a video handoff to sit in the queue
+    until the sender had given up on it.
+    """
+    while not monitor.abortRequested():
         try:
-            command = DACP_QUEUE.get_nowait()
+            command = DACP_QUEUE.get(timeout=0.5)
         except queue.Empty:
-            return
-        dacp_send(command)
+            continue
+        try:
+            dacp_send(command)
+        except Exception as error:  # never let one bad command kill the thread
+            log('dacp: {} failed: {}'.format(command, error), xbmc.LOGERROR)
 
 
 # Transport commands the sender understands, keyed by the notification name a
@@ -628,7 +648,7 @@ def handle_event(line):
     elif line == 'EVENT STOP':
         PENDING_AUDIO['due'] = 0.0
         TRACK.update(title='', artist='', album='', art='')
-        DACP.update(id='', token='', host='', port=0)
+        DACP.update(id='', token='', host='', port=0, retry_at=0.0)
         stop_playback()
     elif line.startswith('EVENT DACP '):
         payload = line[11:].split(' ')
@@ -766,6 +786,7 @@ def main():
     # Held for the life of the service: a Player that goes out of scope stops
     # receiving callbacks.
     player = AirPlayPlayer()
+    threading.Thread(target=dacp_worker, args=(monitor,), daemon=True).start()
     process = None
     complained = False
     backoff = 0.0
@@ -819,7 +840,6 @@ def main():
 
         drain_events()
         service_pending_audio()
-        drain_dacp()
 
         # waitForAbort specifically, because it is also what lets Kodi deliver
         # this add-on's monitor callbacks -- replacing it with an event of our
