@@ -4,13 +4,12 @@ Upstream-Name: inputstream.airplay
 Files: *
 Copyright: 2026 Dom Cobley <popcornmix@gmail.com>
 License: GPL-2.0-or-later
-
 Comment: The files in this source package are GPL-2.0-or-later, which is what
- their SPDX headers say. The binary is not: the build fetches UxPlay
- (https://github.com/FDH2/UxPlay) and links its protocol library, which is not
- distributed here. Most of that library is LGPL-2.1-or-later, but its playfair
- component is GPL-3.0-or-later, so the combined work -- and therefore the
- add-on as installed, which is what addon.xml declares -- is GPL-3.0-or-later.
+ their SPDX headers say. The binary is not: the build links UxPlay's protocol
+ library (https://github.com/FDH2/UxPlay), which is not distributed here. Most
+ of that library is LGPL-2.1-or-later, but its playfair component is
+ GPL-3.0-or-later, so the combined work -- and therefore the add-on as
+ installed, which is what addon.xml declares -- is GPL-3.0-or-later.
 
 License: GPL-2.0-or-later
  This program is free software: you can redistribute it and/or modify it

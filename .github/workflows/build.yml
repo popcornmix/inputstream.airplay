@@ -212,7 +212,6 @@ jobs:
         # up from the same template with the version the add-on declares.
         version=$(sed -n 's/.*  version="\([0-9.]*\)".*/\1/p' inputstream.airplay/addon.xml.in | head -1)
         sed -e "s/@ADDON_VERSION@/${version}/" \
-            -e "s/@DEBIAN_VERSION@/1/" \
             -e "s/@DEBIAN_DISTRO@/unstable/" \
             -e "s/@DEBIAN_DATE@/$(date -R)/" \
             debian/changelog.in > debian/changelog
@@ -223,9 +222,9 @@ jobs:
         dpkg-source --build .
         dsc=$(ls ../kodi-inputstream-airplay_*.dsc)
         echo "linting $dsc"
-        # native-package-with-dash-version is inherited from Kodi's own add-on
-        # packaging, which generates exactly this pairing; source-is-missing
-        # fires on UxPlay's minified web assets, which are not built here.
+        # newer-standards-version fires when the runner's lintian is older
+        # than the Standards-Version declared, which says nothing about this
+        # package; source-is-missing wants sources for files not built here.
         tags=debian-watch-file-is-missing,no-manual-page,source-is-missing
-        tags=$tags,native-package-with-dash-version
+        tags=$tags,newer-standards-version
         lintian --fail-on error,warning --suppress-tags "$tags" "$dsc"
