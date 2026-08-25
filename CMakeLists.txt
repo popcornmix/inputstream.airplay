@@ -134,4 +134,22 @@ set(AIRPLAY_ADDITIONAL_BINARY_EXE $<TARGET_FILE:airplay-receiver>)
 
 build_addon(inputstream.airplay AIRPLAY DEPLIBS)
 
+# Strict warnings for the code written here, and only for it. Setting them
+# through CMAKE_C_FLAGS instead would apply them to UxPlay's sources too, which
+# do not build warning-free and are not ours to fix.
+option(AIRPLAY_STRICT_WARNINGS "Build this add-on's own sources with -Wall -Wextra -Werror" OFF)
+# From the environment as well, for the same reason UXPLAY_SOURCE_DIR is: -D on
+# the outer cmake reaches an add-on's depends, not the add-on.
+if(NOT AIRPLAY_STRICT_WARNINGS AND DEFINED ENV{AIRPLAY_STRICT_WARNINGS})
+  set(AIRPLAY_STRICT_WARNINGS "$ENV{AIRPLAY_STRICT_WARNINGS}")
+endif()
+if(AIRPLAY_STRICT_WARNINGS)
+  message(STATUS "inputstream.airplay: strict warnings on for this add-on's own sources")
+  foreach(_target airplay-receiver inputstream.airplay)
+    if(TARGET ${_target})
+      target_compile_options(${_target} PRIVATE -Wall -Wextra -Werror)
+    endif()
+  endforeach()
+endif()
+
 include(CPack)
