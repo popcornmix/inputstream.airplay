@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+# Uncomment this to turn on verbose mode.
+#export DH_VERBOSE=1
+
+%:
+	dh $@
+
+# UxPlay has to be unpacked here first. Without this the add-on's cmake falls
+# through to downloading it during configure, which fails in a build chroot and
+# is not allowed for anything headed at the archive: the source package has to
+# carry its sources and the build must not reach the network. See README.
+UXPLAY_SOURCE_DIR ?= $(CURDIR)/uxplay
+
+override_dh_auto_configure:
+	@test -f $(UXPLAY_SOURCE_DIR)/lib/raop.h || { \
+	  echo "debian/rules: no UxPlay at $(UXPLAY_SOURCE_DIR)."; \
+	  echo "Unpack the pinned tarball there first; see README."; \
+	  exit 1; }
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=1 \
+	  -DUSE_LTO=1 -DUXPLAY_SOURCE_DIR=$(UXPLAY_SOURCE_DIR)
