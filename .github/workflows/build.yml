@@ -156,9 +156,11 @@ jobs:
         base=${{ github.workspace }}/${app_id}/build/build/depends
         cp -a "$base"/lib/kodi/addons/${app_id}/. "$out"/
         cp -a "$base"/share/kodi/addons/${app_id}/. "$out"/
-        # A .so and the daemon, or the add-on cannot load and cannot run.
+        # A .so and the daemon, or the add-on cannot load and cannot run. The
+        # daemon has to be under bin/ and executable: a zip loses the mode, and
+        # Kodi restores it only for that directory.
         test -e "$out"/${app_id}.so
-        test -x "$out"/airplay-receiver
+        test -x "$out"/bin/airplay-receiver
         find "$out" -maxdepth 1 -type f | sort
     - name: Keep the built add-on
       if: matrix.artifact

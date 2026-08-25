@@ -46,17 +46,23 @@ SOCKET = xbmcvfs.translatePath('special://temp/airplay.sock')
 def receiver_path():
     """Where the daemon binary is.
 
+    Under bin/, because extracting the zip does not carry the execute bit and
+    Kodi restores it only for files in that directory.
+
     A zip install keeps everything in one directory, but a distribution
     package splits the add-on: the library and the daemon go to libdir while
     addon.xml and this script -- which is what getAddonInfo('path') points at
     -- go to datadir. special://xbmcbinaddons is the binary half, so try there
     first and fall back to the one-directory layout.
     """
-    binary = xbmcvfs.translatePath(
-        'special://xbmcbinaddons/{}/airplay-receiver'.format(ADDON_ID))
-    if os.path.exists(binary):
-        return binary
-    return os.path.join(ADDON_PATH, 'airplay-receiver')
+    for root in (xbmcvfs.translatePath('special://xbmcbinaddons/{}'.format(ADDON_ID)),
+                 ADDON_PATH):
+        binary = os.path.join(root, 'bin', 'airplay-receiver')
+        if os.path.exists(binary):
+            return binary
+    # Nothing found: name the place it should have been, so the failure that
+    # follows says something useful.
+    return os.path.join(ADDON_PATH, 'bin', 'airplay-receiver')
 
 STREAM_URL = 'airplay://mirror'
 

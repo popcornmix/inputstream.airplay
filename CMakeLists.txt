@@ -122,6 +122,15 @@ target_include_directories(airplay-receiver PRIVATE
 # playfair.
 target_link_libraries(airplay-receiver PRIVATE airplay Threads::Threads)
 
+# Into a directory called bin, because that is where it has to end up inside
+# the add-on: extracting the zip does not carry the execute bit, and Kodi puts
+# it back only for files under bin/ (LibreELEC's
+# 1004-make-binary-addons-executable.patch, which chmods that directory on
+# install). A binary installed beside addon.xml arrives without +x and the
+# service cannot start it.
+set_target_properties(airplay-receiver PROPERTIES
+                      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # ---------------------------------------------------------------------------
 # Kodi add-on
 # ---------------------------------------------------------------------------
@@ -129,8 +138,10 @@ set(AIRPLAY_SOURCES src/addon/InputStreamAirPlay.cpp)
 set(AIRPLAY_HEADERS src/addon/InputStreamAirPlay.h
                     src/proto.h)
 
-# Ships inside the add-on directory alongside the library.
-set(AIRPLAY_ADDITIONAL_BINARY_EXE $<TARGET_FILE:airplay-receiver>)
+# The whole bin directory rather than the file: ADDITIONAL_BINARY_EXE installs
+# to the add-on's root, and this has to be under bin/. DIRS also installs with
+# the source permissions, so the mode survives as far as the zip.
+set(AIRPLAY_ADDITIONAL_BINARY_DIRS ${CMAKE_BINARY_DIR}/bin)
 
 build_addon(inputstream.airplay AIRPLAY DEPLIBS)
 
