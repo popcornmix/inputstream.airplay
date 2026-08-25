@@ -775,6 +775,11 @@ def handle_event(line):
         log('paired with {}'.format(name))
         xbmcgui.Dialog().notification('AirPlay', '{} paired'.format(name),
                                       xbmcgui.NOTIFICATION_INFO, 4000)
+    elif line == 'EVENT ART':
+        # No artwork for this track. Forget the last one rather than leaving it
+        # up against whatever is playing now. The reader strips the line, so an
+        # empty argument arrives as a bare event.
+        TRACK['art'] = ''
     elif line.startswith('EVENT ART '):
         if TRACK['art'] == line[10:]:
             return

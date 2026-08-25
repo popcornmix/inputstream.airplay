@@ -370,6 +370,11 @@ static void note_sender_alive(void)
  * enforces the remembered list when a PIN is in use, so the two go together.
  */
 static bool g_require_pairing;
+/*
+ * Where paired devices are remembered, one "publickey name" per line. Not
+ * UxPlay's format, which is CSV with the device id as well and is cached in
+ * memory rather than re-read; the two files are not interchangeable.
+ */
 static char g_registry_path[256];
 
 /*
@@ -390,8 +395,23 @@ static pthread_mutex_t g_event_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void send_streaminfo_locked(void); /* defined with the raop callbacks */
 
-/* The library timestamps packets against CLOCK_REALTIME, so anything compared
- * with ntp_time_local has to read the same clock. */
+/*
+ * The library timestamps packets against CLOCK_REALTIME, so anything compared
+ * with ntp_time_local has to read the same clock.
+ *
+ * ntp_time_local, deliberately, and not the sender's own ntp_time_remote with
+ * a single offset applied at the start of the session -- which is what UxPlay
+ * does. Anchoring once preserves the sender's inter-frame spacing exactly but
+ * drifts as the two clocks drift apart, which shows up over a long session;
+ * the library's continuously tracked conversion lets a little timing-channel
+ * jitter into individual timestamps instead, and Kodi's clock discipline
+ * absorbs that. Handing timestamps to a player that has its own resampling
+ * clock is the case the second choice suits.
+ *
+ * Recorded because "audio drifts apart over hours" and "the timestamps
+ * jitter" are the two bug reports that land here, and they pull in opposite
+ * directions.
+ */
 static uint64_t now_realtime_ns(void)
 {
   struct timespec ts;
@@ -536,6 +556,38 @@ static void out_push_locked(struct out_msg* msg)
   g_out_count++;
   g_out_bytes += msg->size;
   pthread_cond_signal(&g_out_cv);
+}
+
+/*
+ * Throw away queued audio. A flush means the sender skipped or seeked, so
+ * anything still waiting belongs to where the track used to be -- without
+ * this it plays out across the boundary before the new position is heard.
+ *
+ * Caller holds g_out_lock.
+ */
+static size_t out_drop_audio_locked(void)
+{
+  struct out_msg** link = &g_out_head;
+  struct out_msg* last = NULL;
+  size_t dropped = 0;
+
+  while (*link)
+  {
+    struct out_msg* msg = *link;
+    if (msg->kind == OUT_MESSAGE && msg->hdr.type == APX_MSG_AUDIO)
+    {
+      *link = msg->next;
+      g_out_count--;
+      g_out_bytes -= msg->size;
+      dropped++;
+      free(msg);
+      continue;
+    }
+    last = msg;
+    link = &msg->next;
+  }
+  g_out_tail = last;
+  return dropped;
 }
 
 /* Caller holds g_out_lock. */
@@ -1875,6 +1927,12 @@ static void cb_audio_process(void* cls, raop_ntp_t* ntp, audio_decode_struct* da
 
 static void cb_audio_flush(void* cls)
 {
+  pthread_mutex_lock(&g_out_lock);
+  const size_t dropped = out_drop_audio_locked();
+  pthread_mutex_unlock(&g_out_lock);
+
+  if (dropped)
+    LOGI("sender skipped or seeked; dropped %zu queued audio frames", dropped);
 }
 static void cb_video_flush(void* cls)
 {
@@ -1905,14 +1963,30 @@ static void cb_conn_feedback(void* cls)
  * end of the sender's slider, and -144 means mute.
  */
 #define APX_VOL_DB_MIN (-30.0)
+/* Anything at or below this is the sender saying mute, not a quiet level. */
+#define APX_VOL_DB_MUTE (-100.0)
+
+/*
+ * Kodi's own scale, in dB. Its 0-100% spans -60..0dB
+ * (ApplicationVolumeHandling.h), which is twice the range AirPlay's slider
+ * covers -- so mapping the slider straight onto the percentage moved Kodi
+ * twice as far per centimetre of slider, and half way down was -30dB where an
+ * Apple TV or UxPlay gives -15dB. Mapping onto the matching dB instead puts
+ * the slider in the upper half of Kodi's range, where it belongs: the bottom
+ * of the phone's slider is -30dB, which is Kodi at 50%, and there is nothing
+ * quieter the phone can ask for.
+ */
+#define APX_KODI_DB_MIN (-60.0)
 
 static int volume_db_to_percent(double db)
 {
+  if (db <= APX_VOL_DB_MUTE)
+    return 0; /* mute, rather than the quiet end of the slider */
   if (db <= APX_VOL_DB_MIN)
-    return 0;
+    db = APX_VOL_DB_MIN;
   if (db > 0.0)
     db = 0.0;
-  int percent = (int)((1.0 + db / -APX_VOL_DB_MIN) * 100.0 + 0.5);
+  int percent = (int)(((db - APX_KODI_DB_MIN) / -APX_KODI_DB_MIN) * 100.0 + 0.5);
   return percent < 0 ? 0 : (percent > 100 ? 100 : percent);
 }
 
@@ -1956,7 +2030,10 @@ static double cb_audio_set_client_volume(void* cls)
   const int percent = atoi(v + 9);
   if (percent <= 0)
     return -144.0;
-  return (percent >= 100) ? 0.0 : (percent / 100.0 - 1.0) * -APX_VOL_DB_MIN;
+  /* The inverse of volume_db_to_percent; anything below the bottom of the
+   * phone's range shows as the bottom of its slider. */
+  const double db = APX_KODI_DB_MIN + (percent / 100.0) * -APX_KODI_DB_MIN;
+  return db < APX_VOL_DB_MIN ? APX_VOL_DB_MIN : (db > 0.0 ? 0.0 : db);
 }
 /*
  * The sender describes the current track with a DMAP blob: a sequence of
@@ -2028,6 +2105,13 @@ static void cb_audio_set_metadata(void* cls, const void* buffer, int buflen)
 
   LOGI("now playing: %s - %s (%s)", artist, title, album);
 }
+/* The sender has nothing to show for the current track; drop the last one
+ * rather than leaving it up against whatever is playing now. */
+static void cb_audio_stop_coverart_rendering(void* cls)
+{
+  emit_event_arg("ART", "");
+}
+
 static void cb_audio_set_coverart(void* cls, const void* buffer, int buflen)
 {
   if (!buffer || buflen <= 0)
@@ -2833,6 +2917,7 @@ int main(int argc, char** argv)
   cbs.audio_set_client_volume = cb_audio_set_client_volume;
   cbs.audio_set_metadata = cb_audio_set_metadata;
   cbs.audio_set_coverart = cb_audio_set_coverart;
+  cbs.audio_stop_coverart_rendering = cb_audio_stop_coverart_rendering;
   cbs.audio_set_progress = cb_audio_set_progress;
   cbs.on_video_play = cb_on_video_play;
   cbs.on_video_scrub = cb_on_video_scrub;

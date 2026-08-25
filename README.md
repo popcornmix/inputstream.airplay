@@ -35,6 +35,22 @@ input, and a fault there stops a helper rather than taking Kodi down.
 | Forget paired devices | -- | Asks every device for the pairing code again the next time it connects. |
 | Verbose logging | off | The whole AirPlay conversation and each packet handed to the player. For diagnosing a problem; see Troubleshooting. |
 
+## Behaviour worth knowing
+
+A second sender takes the session from the first, the way an Apple TV does.
+UxPlay defaults to the opposite -- holding the session and turning newcomers
+away, with `-nohold` to opt in -- so if you have come from there, expect this
+one to hand over rather than refuse.
+
+Access is by password or pairing, both off by default, and both advertised over
+mDNS so a sender knows before it is challenged. There is no allow or block list
+by device: UxPlay has `-restrict`/`-allow`/`-block`, and pairing covers the same
+ground here.
+
+The phone's volume slider covers -30dB to 0dB, which is the upper half of
+Kodi's own scale, so the bottom of the slider leaves Kodi at 50% -- there is
+nothing quieter the phone can ask for. Mute is separate and does mute.
+
 ## Latency, and the Kodi patches
 
 Out of the box on an unmodified Kodi this works, but mirroring runs about a

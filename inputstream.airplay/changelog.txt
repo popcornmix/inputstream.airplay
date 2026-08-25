@@ -1,4 +1,9 @@
 v0.1.6
+- The phone's volume slider now moves Kodi by the same amount it would move an
+  Apple TV; it covers the upper half of Kodi's range, and mute still mutes.
+- Skipping or seeking on the phone no longer plays out the old track's last
+  moment first.
+- Artwork is dropped when a track has none, instead of showing the last one's.
 - Mirroring runs at the screen's frame rate rather than the library's default
   of 30, which is what a sender was being told to encode for.
 - A sender that goes away without saying so -- out of range, out of battery,
