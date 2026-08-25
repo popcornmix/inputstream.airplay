@@ -332,6 +332,38 @@ static bool g_offer_mirroring = true;
 static bool g_verbose;
 
 /*
+ * When the sender was last heard from, by any route. Zero when there is no
+ * session to watch.
+ *
+ * A phone that leaves wifi range, runs out of battery or is simply locked does
+ * not tear the session down, and nothing else notices quickly: the mirror
+ * socket has kernel keepalive, which takes about two minutes, and an audio
+ * session has nothing at all -- RTP is UDP and the control sockets set no
+ * keepalive -- so Kodi sat on a frozen frame or a silent stream until someone
+ * stopped it by hand.
+ *
+ * Deliberately not just the RTSP /feedback poll that UxPlay counts. A sender
+ * streaming a video stops sending those and polls the HTTP endpoints instead,
+ * which is what made UxPlay's own watchdog cut off working playback
+ * (FDH2/UxPlay#542). Anything that could only have come from the sender counts.
+ */
+static _Atomic uint64_t g_last_contact_ns;
+
+/*
+ * How long silence means gone. UxPlay's -reset default, and comfortably more
+ * than any interval seen in practice: feedback arrives about every two
+ * seconds, a video session polls for playback info about every one.
+ */
+#define APX_SENDER_GONE_NS (15ull * 1000000000ull)
+
+static uint64_t now_ns(void);
+
+static void note_sender_alive(void)
+{
+  g_last_contact_ns = now_ns();
+}
+
+/*
  * Pairing. With this on the sender is shown a four digit code the first time
  * it connects, and once it has been entered the device is remembered and is
  * not asked again -- which is how an Apple TV behaves. The library only
@@ -1008,6 +1040,32 @@ static char* base64_encode(const uint8_t* in, size_t len)
  * time, on a connection of its own. */
 #define APX_RPC_ID "1"
 
+/*
+ * Whether this one object is the response to our request.
+ *
+ * Two things have to hold. The id has to be ours and not merely start with it:
+ * a Player.OnPlay announcement carries the library item's database id, so
+ * "id":123 contains "id":1 and a plain substring match takes the notification
+ * for the reply. And a JSON-RPC response never carries a method at the top
+ * level, while every notification does -- which is the cheap way to tell them
+ * apart whatever the ids happen to be.
+ */
+static bool json_is_our_response(const char* obj, const char* id_needle)
+{
+  if (strstr(obj, "\"method\":"))
+    return false;
+
+  for (const char* at = strstr(obj, id_needle); at; at = strstr(at + 1, id_needle))
+  {
+    /* The character after the id must end it, or we matched a prefix of a
+     * longer number. */
+    const char end = at[strlen(id_needle)];
+    if (end == ',' || end == '}' || end == ' ')
+      return true;
+  }
+  return false;
+}
+
 static char* json_find_response(char* buf, const char* id_needle)
 {
   int depth = 0;
@@ -1040,10 +1098,10 @@ static char* json_find_response(char* buf, const char* id_needle)
       /* A complete top level object; is it the one we asked for? */
       const char saved = p[1];
       p[1] = '\0';
-      char* found = strstr(start, id_needle) ? start : NULL;
+      const bool ours = json_is_our_response(start, id_needle);
       p[1] = saved;
-      if (found)
-        return found;
+      if (ours)
+        return start;
       start = NULL;
     }
   }
@@ -1240,6 +1298,7 @@ static bool should_reoffer_locked(void)
 
 static void cb_conn_init(void* cls)
 {
+  note_sender_alive();
   LOGI("client session started");
 }
 
@@ -1279,6 +1338,7 @@ static void end_session_maybe(session_mode_t expected)
   g_unstartable_since_ns = 0;
   g_mirror_stop_pending_ns = 0;
   g_video_seen_playing = false;
+  g_last_contact_ns = 0;
   memset(&g_info, 0, sizeof(g_info));
   g_info.sample_rate = 44100;
   g_info.channels = 2;
@@ -1580,6 +1640,8 @@ static void cb_video_process(void* cls, raop_ntp_t* ntp, video_decode_struct* da
     return;
   }
 
+  note_sender_alive();
+
   pthread_mutex_lock(&g_lock);
 
   g_frames_in++;
@@ -1761,6 +1823,8 @@ static void cb_audio_process(void* cls, raop_ntp_t* ntp, audio_decode_struct* da
    * never told about can have the demuxer bring that stream into being, which
    * would restore the stalling this setting exists to avoid.
    */
+  note_sender_alive();
+
   pthread_mutex_lock(&g_lock);
 
   if (g_session.mode == MODE_MIRROR && !g_mirror_audio)
@@ -1815,14 +1879,26 @@ static void cb_audio_flush(void* cls)
 static void cb_video_flush(void* cls)
 {
 }
+/*
+ * The sender flags these in the mirror stream when the screen locks or an app
+ * goes away, as distinct from the screen simply being static. Nothing acts on
+ * them -- the gap logic covers both cases -- but a suspend arriving before a
+ * silence turns "sender paused for 6032 ms" from a mystery into a fact.
+ *
+ * The library also raises a pause for malformed HEVC parameter sets, so this
+ * is advisory rather than a promise about what the sender is doing.
+ */
 static void cb_video_pause(void* cls)
 {
+  LOGI("sender suspended the mirror stream");
 }
 static void cb_video_resume(void* cls)
 {
+  LOGI("sender resumed the mirror stream");
 }
 static void cb_conn_feedback(void* cls)
 {
+  note_sender_alive();
 }
 /*
  * AirPlay carries volume as attenuation in dB: 0 is full, -30 is the quiet
@@ -2242,6 +2318,8 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
 {
   if (!info)
     return;
+
+  note_sender_alive();
 
   double position = 0.0, duration = 0.0;
   float rate = 0.0f;
@@ -2674,8 +2752,59 @@ int main(int argc, char** argv)
     return start_failed(listener, sock_path);
   }
 
+  /*
+   * Empty or unset means the receiver is open to anyone on the network, which
+   * is what it was before this was configurable.
+   *
+   * The add-on sends the password on stdin rather than in the environment: a
+   * process environment stays readable through /proc for as long as it runs,
+   * and this is a secret someone typed. AIRPLAY_PASSWORD remains for running
+   * the receiver by hand.
+   */
+  if (getenv("AIRPLAY_PASSWORD_STDIN"))
+  {
+    if (fgets(g_password, sizeof(g_password), stdin))
+    {
+      char* end = strpbrk(g_password, "\r\n");
+      if (end)
+        *end = '\0';
+      else if (strlen(g_password) == sizeof(g_password) - 1)
+        LOGI("password is longer than %zu characters and has been cut short; "
+             "the sender will not accept the rest of it",
+             sizeof(g_password) - 1);
+    }
+    fclose(stdin);
+  }
+  else
+  {
+    const char* password = getenv("AIRPLAY_PASSWORD");
+    if (password)
+      snprintf(g_password, sizeof(g_password), "%s", password);
+  }
+  if (g_password[0])
+    LOGI("client access password set");
+
+  const char* reg = getenv("AIRPLAY_REGISTRY");
+  if (reg && *reg)
+    snprintf(g_registry_path, sizeof(g_registry_path), "%s", reg);
+  const char* pairing = getenv("AIRPLAY_PAIRING");
+  g_require_pairing = pairing && *pairing && *pairing != '0' && g_registry_path[0];
+
+  /*
+   * Tell the network what a sender has to do to connect. This drives the
+   * pw flag and the RAOP status flags in the mDNS records, and it has to be
+   * known before dnssd_init -- which is why the block above is read here
+   * rather than with the rest of the settings.
+   *
+   * Advertising nothing while enforcing a password left the network told the
+   * receiver was open: iOS copes, since a challenge raises the prompt anyway,
+   * but a sender that trusts the advertisement shows no padlock and may take
+   * the challenge for an error.
+   */
+  const unsigned char pin_pw = g_require_pairing ? 1 : (g_password[0] ? 2 : 0);
+
   int dnssd_error = 0;
-  g_dnssd = dnssd_init(name, (int)strlen(name), mac, 6, 0, &dnssd_error);
+  g_dnssd = dnssd_init(name, (int)strlen(name), mac, 6, pin_pw, &dnssd_error);
   if (!g_dnssd || dnssd_error)
   {
     LOGI("dnssd_init failed: %d", dnssd_error);
@@ -2741,44 +2870,6 @@ int main(int argc, char** argv)
     LOGI("raop_init2 failed");
     return start_failed(listener, sock_path);
   }
-
-  /*
-   * Empty or unset means the receiver is open to anyone on the network, which
-   * is what it was before this was configurable.
-   *
-   * The add-on sends the password on stdin rather than in the environment: a
-   * process environment stays readable through /proc for as long as it runs,
-   * and this is a secret someone typed. AIRPLAY_PASSWORD remains for running
-   * the receiver by hand.
-   */
-  if (getenv("AIRPLAY_PASSWORD_STDIN"))
-  {
-    if (fgets(g_password, sizeof(g_password), stdin))
-    {
-      char* end = strpbrk(g_password, "\r\n");
-      if (end)
-        *end = '\0';
-      else if (strlen(g_password) == sizeof(g_password) - 1)
-        LOGI("password is longer than %zu characters and has been cut short; "
-             "the sender will not accept the rest of it",
-             sizeof(g_password) - 1);
-    }
-    fclose(stdin);
-  }
-  else
-  {
-    const char* password = getenv("AIRPLAY_PASSWORD");
-    if (password)
-      snprintf(g_password, sizeof(g_password), "%s", password);
-  }
-  if (g_password[0])
-    LOGI("client access password set");
-
-  const char* reg = getenv("AIRPLAY_REGISTRY");
-  if (reg && *reg)
-    snprintf(g_registry_path, sizeof(g_registry_path), "%s", reg);
-  const char* pairing = getenv("AIRPLAY_PAIRING");
-  g_require_pairing = pairing && *pairing && *pairing != '0' && g_registry_path[0];
 
   const char* mirror = getenv("AIRPLAY_MIRRORING");
   g_offer_mirroring = !(mirror && *mirror && *mirror == '0');
@@ -2866,7 +2957,17 @@ int main(int argc, char** argv)
     raop_set_plist(g_raop, "width", atoi(w));
     raop_set_plist(g_raop, "height", atoi(h));
     if (hz && atoi(hz) > 0)
+    {
       raop_set_plist(g_raop, "refreshRate", atoi(hz));
+      /*
+       * And how fast it will accept frames. The library defaults this to 30
+       * and hands that to the sender, which then encodes at 30 -- so telling
+       * it about a 60Hz screen while leaving this alone asked for half the
+       * frames the screen can show, and put a 33ms interval into a path this
+       * add-on works hard to keep short.
+       */
+      raop_set_plist(g_raop, "maxFPS", atoi(hz));
+    }
     LOGI("display reported as %sx%s@%sHz", w, h, hz && *hz ? hz : "60");
   }
 
@@ -2953,6 +3054,25 @@ int main(int argc, char** argv)
       pthread_mutex_unlock(&g_lock);
       LOGI("mirroring cannot be rejoined without a keyframe, ending the session");
       raop_remove_known_connections(g_raop);
+      continue;
+    }
+
+    /*
+     * The sender has gone without saying so. Ending the session stops Kodi
+     * sitting on a frozen frame or a silent stream, and lets the phone start
+     * a fresh one when it comes back.
+     */
+    const uint64_t last_contact = g_last_contact_ns;
+    const session_mode_t mode_now = g_session.mode;
+    const bool sender_gone =
+        mode_now != MODE_IDLE && last_contact && now - last_contact > APX_SENDER_GONE_NS;
+    if (sender_gone)
+    {
+      g_last_contact_ns = 0;
+      pthread_mutex_unlock(&g_lock);
+      LOGI("nothing from the sender for %llu seconds, ending the session",
+           (unsigned long long)((now - last_contact) / 1000000000ull));
+      end_session_maybe(mode_now);
       continue;
     }
 

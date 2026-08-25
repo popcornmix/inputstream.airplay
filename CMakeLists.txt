@@ -59,6 +59,14 @@ set(UXPLAY_SHA256 "0f5bf6f2ab3d1ac3ccaf4418afe00137ec1ba97c2a345710202fca40f6a1f
 
 set(UXPLAY_SOURCE_DIR "" CACHE PATH "Unpacked UxPlay source, instead of fetching")
 
+# Also from the environment. Kodi's add-on buildsystem hands user arguments to
+# an add-on's *depends* rather than to the add-on itself, so -D on the outer
+# cmake never arrives here; the environment does, and it saves a distribution
+# threading the value through dh_auto_configure as well.
+if(NOT UXPLAY_SOURCE_DIR AND DEFINED ENV{UXPLAY_SOURCE_DIR})
+  set(UXPLAY_SOURCE_DIR "$ENV{UXPLAY_SOURCE_DIR}")
+endif()
+
 if(UXPLAY_SOURCE_DIR)
   if(NOT EXISTS "${UXPLAY_SOURCE_DIR}/lib/raop.h")
     message(FATAL_ERROR "UXPLAY_SOURCE_DIR=${UXPLAY_SOURCE_DIR} does not look like UxPlay")

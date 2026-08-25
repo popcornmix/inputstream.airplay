@@ -51,7 +51,7 @@ jobs:
             CC: gcc
             CXX: g++
             uxplay_source: true
-            extra_cmake: -DCMAKE_C_FLAGS=-Wall -Wextra -Werror
+            werror: true
     steps:
     # master is Piers, the series repo-binary-addons currently tracks. Build
     # against Omega too, so a change that only compiles against the newest
@@ -80,7 +80,8 @@ jobs:
         cd ${{ github.workspace }}/${app_id}
         echo "version=$(sed -n 's/.*UXPLAY_VERSION "\(.*\)".*/\1/p' CMakeLists.txt)" >> $GITHUB_OUTPUT
     - name: Cache the UxPlay tarball
-      uses: actions/cache@v4
+      if: matrix.uxplay_source
+      uses: actions/cache@v5
       with:
         path: ${{ github.workspace }}/uxplay-tarball
         key: uxplay-${{ steps.uxplay.outputs.version }}
@@ -101,6 +102,11 @@ jobs:
       env:
         CC: ${{ matrix.CC }}
         CXX: ${{ matrix.CXX }}
+        # Read by the add-on's own CMakeLists. ADDON_EXTRA_ARGS cannot carry
+        # this: Kodi's buildsystem feeds that to the depends, not to the
+        # add-on, so the value never arrived and the job quietly built the
+        # depends route it was added to avoid.
+        UXPLAY_SOURCE_DIR: ${{ matrix.uxplay_source && format('{0}/uxplay', github.workspace) || '' }}
       run: |
         cmake \
           -B ${app_id}/build \
@@ -109,10 +115,19 @@ jobs:
           -DADDONS_DEFINITION_DIR=${{ github.workspace }}/xbmc/cmake/addons/addons \
           -DCMAKE_BUILD_TYPE=Debug \
           -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/xbmc/addons \
-          ${{ matrix.uxplay_source && format('-DADDON_EXTRA_ARGS=-DUXPLAY_SOURCE_DIR={0}/uxplay', github.workspace) || '' }} \
+          ${{ matrix.werror && '"-DCMAKE_C_FLAGS=-Wall -Wextra -Werror"' || '' }} \
           ${{ github.workspace }}/xbmc/cmake/addons
     - name: Build
-      run: cmake --build ${app_id}/build
+      run: cmake --build ${app_id}/build 2>&1 | tee ${{ github.workspace }}/build.log
+    - name: Check the build used the unpacked UxPlay
+      if: matrix.uxplay_source
+      run: |
+        # The job exists to cover the offline route; without this it silently
+        # built the depends route instead and still passed.
+        grep -q "using UxPlay from ${{ github.workspace }}/uxplay" ${{ github.workspace }}/build.log
+    - name: Check the warning flags reached the compiler
+      if: matrix.werror
+      run: grep -q -- "-Werror" ${{ github.workspace }}/build.log
 
     # Run against the built add-on rather than the source tree: addon.xml is
     # generated from addon.xml.in during the build, and the checker reads it.
@@ -188,10 +203,15 @@ jobs:
           exit 1
         fi
         grep -q "no UxPlay at" out.txt
-    - name: Lint the packaging
+    - name: Lint the source package
       run: |
         lintian --version
-        # Source-only, since the binary cannot be built here.
-        lintian --fail-on error --suppress-tags \
-          debian-watch-file-is-missing,no-manual-page \
-          debian/control || true
+        # lintian takes packages, not control files. A source package can be
+        # built without configuring anything, which is as far as this runner
+        # gets -- kodi-addon-dev is not in its archive.
+        dpkg-source --build .
+        dsc=$(ls ../kodi-inputstream-airplay_*.dsc)
+        echo "linting $dsc"
+        lintian --fail-on error,warning --suppress-tags \
+          debian-watch-file-is-missing,no-manual-page,source-is-missing \
+          "$dsc"

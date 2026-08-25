@@ -1,4 +1,10 @@
 v0.1.6
+- Mirroring runs at the screen's frame rate rather than the library's default
+  of 30, which is what a sender was being told to encode for.
+- A sender that goes away without saying so -- out of range, out of battery,
+  locked -- is noticed in fifteen seconds rather than two minutes or never.
+- A password or pairing requirement is advertised, so a sender knows about it
+  before it is challenged.
 - Accepts H.265 mirroring, which is what a phone sends to a 4K display. Without
   it mirroring failed outright on those.
 - The receiver writes to the add-on from a thread of its own, so a slow
