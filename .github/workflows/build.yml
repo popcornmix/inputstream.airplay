@@ -24,6 +24,7 @@ jobs:
             os: ubuntu-latest
             CC: gcc
             CXX: g++
+            artifact: x86_64
           - name: "Linux Clang build"
             os: ubuntu-latest
             CC: clang
@@ -40,6 +41,11 @@ jobs:
           # The route a distribution takes, and the only one that works without
           # a network. Also the strictest warnings, so what is already true
           # stays true for code doing pointer arithmetic over network buffers.
+          - name: "Linux GCC build (aarch64)"
+            os: ubuntu-24.04-arm
+            CC: gcc
+            CXX: g++
+            artifact: aarch64
           - name: "Linux GCC build (unpacked UxPlay, -Werror)"
             os: ubuntu-latest
             CC: gcc
@@ -126,13 +132,25 @@ jobs:
         fi
         kodi-addon-checker --branch=piers "$(dirname "${addon_xml}")"
 
+    - name: Collect the built add-on
+      if: matrix.artifact
+      run: |
+        out=${{ github.workspace }}/artifact/${app_id}
+        mkdir -p "$out"
+        base=${{ github.workspace }}/${app_id}/build/build/depends
+        cp -a "$base"/lib/kodi/addons/${app_id}/. "$out"/
+        cp -a "$base"/share/kodi/addons/${app_id}/. "$out"/
+        # A .so and the daemon, or the add-on cannot load and cannot run.
+        test -e "$out"/${app_id}.so
+        test -x "$out"/airplay-receiver
+        find "$out" -maxdepth 1 -type f | sort
     - name: Keep the built add-on
-      if: matrix.name == 'Linux GCC build'
+      if: matrix.artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ env.app_id }}-linux
-        path: ${{ github.workspace }}/${{ env.app_id }}/build/build/*/share/kodi/addons/${{ env.app_id }}
-        if-no-files-found: warn
+        name: ${{ env.app_id }}-${{ matrix.artifact }}
+        path: ${{ github.workspace }}/artifact
+        if-no-files-found: error
 
   format:
     name: "clang-format"
