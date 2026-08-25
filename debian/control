@@ -1,7 +1,7 @@
 Source: kodi-inputstream-airplay
 Priority: optional
 Maintainer: Dom Cobley <popcornmix@gmail.com>
-Build-Depends: debhelper-compat (= 13), cmake, pkg-config, libssl-dev,
+Build-Depends: debhelper-compat (= 13), cmake, pkgconf | pkg-config, libssl-dev,
                libplist-dev, kodi-addon-dev
 Standards-Version: 4.6.2
 Section: libs
