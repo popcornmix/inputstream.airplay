@@ -268,6 +268,14 @@ static uint64_t g_last_audio_ns;
  * anything, so one that never starts can be closed again.
  */
 #define APX_AUDIO_NOSTART_NS (10ull * 1000000000ull)
+
+/*
+ * How long without a mirror audio frame means the sender has torn that stream
+ * down. iOS keeps a mirroring audio session running even while the phone is
+ * making no noise, so frames arrive continuously for as long as the stream
+ * exists; a gap of seconds only happens once it has gone.
+ */
+#define APX_AUDIO_GONE_NS (2ull * 1000000000ull)
 static uint64_t g_audio_session_ns; /* when the audio format was negotiated */
 static uint64_t g_audio_session_frames;
 
@@ -3159,6 +3167,29 @@ int main(int argc, char** argv)
            (unsigned long long)((now - last_contact) / 1000000000ull));
       end_session_maybe(mode_now);
       continue;
+    }
+
+    /*
+     * Mirror audio has stopped for good. Kodi declared the track, so when its
+     * queue ran dry it flushed and went back to waiting for a first packet on
+     * every stream it knows about -- which never comes, leaving the last
+     * picture frozen on screen while video carries on arriving. Withdraw the
+     * track so the video stream can start on its own. cb_audio_process offers
+     * it again if the sender sets audio up a second time.
+     */
+    if (g_session.mode == MODE_MIRROR && g_client_connected && g_info.audio_ct != APX_ACT_NONE &&
+        g_last_audio_ns && now - g_last_audio_ns > APX_AUDIO_GONE_NS)
+    {
+      LOGI("no mirror audio for %llu ms, withdrawing the audio track",
+           (unsigned long long)((now - g_last_audio_ns) / 1000000ull));
+      g_last_audio_ns = 0;
+      g_info.audio_ct = APX_ACT_NONE;
+      g_info.audio_extradata_size = 0;
+      g_sent_streaminfo = false;
+      pthread_mutex_lock(&g_out_lock);
+      out_drop_audio_locked();
+      pthread_mutex_unlock(&g_out_lock);
+      send_streaminfo_locked();
     }
 
     const bool never_started = g_session.mode == MODE_AUDIO && g_session.player_open &&
