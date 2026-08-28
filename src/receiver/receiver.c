@@ -2125,12 +2125,40 @@ static void cb_audio_set_coverart(void* cls, const void* buffer, int buflen)
   if (!buffer || buflen <= 0)
     return;
 
-  /* Alternate between two names so Kodi reloads the image rather than serving
-   * the previous track's artwork from its texture cache. */
-  static int slot;
+  /*
+   * Named after the image itself. Kodi's texture cache is keyed on the path
+   * and holds what it first loaded there, so a name may never be reused for
+   * different bytes -- which is what reusing a fixed name, or rotating a
+   * couple of them, ends up doing as soon as the rotation comes round again.
+   *
+   * A digest of the bytes rather than a counter, because the same artwork has
+   * to keep the same name: a show is played over and over, and a fresh name
+   * each time would leave Kodi caching another copy of an identical image on
+   * every play, with nothing that ever prunes them. This way each distinct
+   * image is stored once, however often it is heard, and it survives a
+   * restart of either end.
+   */
+  const unsigned char* bytes = buffer;
+  uint64_t digest = 1469598103934665603ull; /* FNV-1a, 64 bit */
+  for (int i = 0; i < buflen; i++)
+  {
+    digest ^= bytes[i];
+    digest *= 1099511628211ull;
+  }
+
   char path[256];
-  snprintf(path, sizeof(path), "%s/art%d.jpg", g_art_dir[0] ? g_art_dir : "/tmp", slot);
-  slot ^= 1;
+  snprintf(path, sizeof(path), "%s/art-%016llx.jpg", g_art_dir[0] ? g_art_dir : "/tmp",
+           (unsigned long long)digest);
+
+  /* Already on disk from an earlier play. The bytes are the same by
+   * construction, so leave the file alone -- rewriting it would change the
+   * mtime Kodi decides staleness by for no gain. */
+  struct stat st;
+  if (stat(path, &st) == 0 && st.st_size == buflen)
+  {
+    emit_event_arg("ART", path);
+    return;
+  }
 
   FILE* f = fopen(path, "wb");
   if (!f)
@@ -2138,7 +2166,10 @@ static void cb_audio_set_coverart(void* cls, const void* buffer, int buflen)
   size_t written = fwrite(buffer, 1, (size_t)buflen, f);
   fclose(f);
   if (written != (size_t)buflen)
+  {
+    unlink(path);
     return;
+  }
 
   emit_event_arg("ART", path);
 }
