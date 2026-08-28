@@ -274,6 +274,12 @@ static uint64_t g_last_audio_ns;
 static uint64_t g_client_since_ns;
 static bool g_client_got_media;
 
+/*
+ * Whether the audio stream last negotiated is music in its own right rather
+ * than the sound belonging to a mirrored screen or a video being cast.
+ */
+static bool g_audio_is_music;
+
 /* How long a client may go from connecting to being sent anything at all. */
 #define APX_CLIENT_NOSTART_NS (10ull * 1000000000ull)
 
@@ -1683,7 +1689,8 @@ static void cb_audio_get_format(void* cls,
    * demoted the video session a second in, and every poll after that told the
    * sender there was no video, which stopped it dead.
    */
-  if (!*usingScreen && g_info.video_codec == APX_VCODEC_NONE && g_session.mode != MODE_VIDEO)
+  g_audio_is_music = !*usingScreen && g_info.video_codec == APX_VCODEC_NONE;
+  if (g_audio_is_music && g_session.mode != MODE_VIDEO)
     session_set_mode_locked(MODE_AUDIO);
   /* Nothing else will ask Kodi to open the stream for a music session. */
   const char* play = g_session.mode == MODE_AUDIO ? request_playback_locked() : NULL;
@@ -2479,6 +2486,23 @@ static void cb_on_video_stop(void* cls)
   }
 
   /*
+   * A sender that moves from a video to music sets the music session up before
+   * it stops the video, and cb_audio_get_format() refuses to take an audio
+   * stream negotiated under a video as music -- a cast video has a RAOP
+   * channel of its own, and treating that as a music session demotes the
+   * video a second in. So the stream that is left once the video goes has to
+   * be adopted here, or it plays to nobody: the format is about to be
+   * forgotten, and nothing negotiates it again.
+   */
+  struct apx_streaminfo audio = {0};
+  pthread_mutex_lock(&g_lock);
+  const bool music_live =
+      g_audio_is_music && g_last_audio_ns && now_ns() - g_last_audio_ns < APX_AUDIO_GONE_NS;
+  if (music_live)
+    audio = g_info;
+  pthread_mutex_unlock(&g_lock);
+
+  /*
    * The shared teardown rather than just a mode change, because a video
    * session leaves player_open set -- it is set when the handoff is offered,
    * and cleared when the add-on disconnects, which for a video Kodi fetches
@@ -2486,6 +2510,27 @@ static void cb_on_video_stop(void* cls)
    * session that follows.
    */
   end_session_maybe(MODE_IDLE);
+
+  if (!music_live)
+    return;
+
+  LOGI("airplay video: music is still playing, taking it as the session");
+  pthread_mutex_lock(&g_lock);
+  g_info.audio_ct = audio.audio_ct;
+  g_info.sample_rate = audio.sample_rate;
+  g_info.channels = audio.channels;
+  g_info.audio_extradata_size = audio.audio_extradata_size;
+  memcpy(g_info.audio_extradata, audio.audio_extradata, sizeof(g_info.audio_extradata));
+  g_sent_streaminfo = false;
+  g_last_audio_ns = now_ns();
+  g_audio_session_ns = g_last_audio_ns;
+  g_audio_session_frames = 0;
+  session_set_mode_locked(MODE_AUDIO);
+  const char* play = request_playback_locked();
+  pthread_mutex_unlock(&g_lock);
+
+  if (play)
+    emit_event(play);
 }
 
 static float cb_on_video_playlist_remove(void* cls)
