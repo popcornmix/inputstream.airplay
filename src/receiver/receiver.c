@@ -202,6 +202,20 @@ static void session_set_mode_locked(session_mode_t mode)
     return;
   LOGI("session: %s -> %s", mode_name(g_session.mode), mode_name(mode));
   g_session.mode = mode;
+
+  /*
+   * An idle session has no player open. Otherwise the flag is only cleared
+   * when the add-on disconnects or the session is wound up through
+   * end_session_maybe(), and a video Kodi fetches and plays itself has no
+   * add-on to disconnect -- so the paths that reach idle any other way, a
+   * video finishing among them, left it standing. Nothing says so at the
+   * time: request_playback_locked() and should_reoffer_locked() both refuse
+   * while it is set, so the next session is simply never offered and the
+   * sender streams to a Kodi that does nothing. Tied to the mode here so
+   * another path to idle cannot forget it.
+   */
+  if (mode == MODE_IDLE)
+    g_session.player_open = false;
 }
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
