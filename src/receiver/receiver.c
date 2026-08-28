@@ -2460,10 +2460,32 @@ static void cb_on_video_rate(void* cls, const float rate)
 static void cb_on_video_stop(void* cls)
 {
   LOGI("airplay video: stopped by sender");
+
   pthread_mutex_lock(&g_lock);
-  session_set_mode_locked(MODE_IDLE);
+  const session_mode_t mode = g_session.mode;
   pthread_mutex_unlock(&g_lock);
-  emit_event("HLSSTOP");
+
+  /*
+   * This arrives late as well as on time: the sender ends a video, sets up an
+   * audio session or mirroring, and the stop for the video it has already
+   * left lands after the new session has started. Winding that one up strands
+   * it -- the stream keeps arriving, but playback is only ever offered for a
+   * session that has a mode, so nothing plays it and nothing recovers.
+   */
+  if (mode == MODE_AUDIO || mode == MODE_MIRROR)
+  {
+    LOGI("airplay video: ignoring the stop, a %s session has started since", mode_name(mode));
+    return;
+  }
+
+  /*
+   * The shared teardown rather than just a mode change, because a video
+   * session leaves player_open set -- it is set when the handoff is offered,
+   * and cleared when the add-on disconnects, which for a video Kodi fetches
+   * itself never happens. Left standing it suppresses the offer for every
+   * session that follows.
+   */
+  end_session_maybe(MODE_IDLE);
 }
 
 static float cb_on_video_playlist_remove(void* cls)
