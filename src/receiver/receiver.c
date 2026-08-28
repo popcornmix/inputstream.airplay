@@ -1363,10 +1363,32 @@ static void cb_conn_init(void* cls)
 }
 
 /*
- * Wind the session up: tell the add-on the stream is over and forget
- * everything derived from it, so the next session starts from scratch.
+ * Tell the add-on the stream it is reading has finished, and forget everything
+ * describing it, so the next one starts from scratch. Kodi closes the player
+ * on the end of stream; without one it sits in the caching state it opened in,
+ * waiting for data that has stopped coming, and the busy dialog it raised to
+ * do that stays on screen.
  */
+static void end_client_stream_locked(void)
+{
+  send_msg_locked(APX_MSG_EOS, 0, 0, NULL, 0);
+  g_have_base = false;
+  g_params_len = 0;
+  gop_clear();
+  g_primed = false;
+  g_video_started = false;
+  g_sent_streaminfo = false;
+  g_last_audio_ns = 0;
+  g_audio_session_ns = 0;
+  g_audio_session_frames = 0;
+  memset(&g_info, 0, sizeof(g_info));
+  g_info.sample_rate = 44100;
+  g_info.channels = 2;
+}
+
 /*
+ * Wind the session up.
+ *
  * expected is for the watchdog, which decides to end a session and then has to
  * drop g_lock before saying so. A video handoff can arrive in that window and
  * has already set MODE_VIDEO; tearing the session down then would undo the
@@ -1382,15 +1404,7 @@ static void end_session_maybe(session_mode_t expected)
     pthread_mutex_unlock(&g_lock);
     return;
   }
-  send_msg_locked(APX_MSG_EOS, 0, 0, NULL, 0);
-  g_have_base = false;
-  g_params_len = 0;
-  gop_clear();
-  g_primed = false;
-  g_video_started = false;
-  g_last_audio_ns = 0;
-  g_audio_session_ns = 0;
-  g_audio_session_frames = 0;
+  end_client_stream_locked();
   session_set_mode_locked(MODE_IDLE);
   g_session.notify_video_ended = false;
   g_meta_previous[0] = '\0';
@@ -1399,9 +1413,6 @@ static void end_session_maybe(session_mode_t expected)
   g_mirror_stop_pending_ns = 0;
   g_video_seen_playing = false;
   g_last_contact_ns = 0;
-  memset(&g_info, 0, sizeof(g_info));
-  g_info.sample_rate = 44100;
-  g_info.channels = 2;
   /*
    * Deliberately not gated on player_open: that flag is cleared whenever the
    * add-on disconnects, which is how a re-offer becomes possible, so gating
@@ -2389,6 +2400,13 @@ static void cb_on_video_play(void* cls, const char* location, const float start_
    * declared finished on its first poll -- before it has played a frame.
    */
   g_session.notify_video_ended = false;
+  /*
+   * Kodi plays the nominated URL itself, so the add-on takes no part in what
+   * follows and nothing else will tell it so: the session is not ending, so
+   * end_session_maybe() is not called. Left reading, its player never starts
+   * and the spinner over it outlives the video meant to replace it.
+   */
+  end_client_stream_locked();
   session_set_mode_locked(MODE_VIDEO);
   g_video_start_ns = now_ns();
   g_session.player_open = true; /* so a later teardown still asks for a stop */
