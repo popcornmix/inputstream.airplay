@@ -261,6 +261,23 @@ static bool g_priming;
 static uint64_t g_last_audio_ns;
 
 /*
+ * When the current add-on client connected, and whether anything to play has
+ * reached it since.
+ *
+ * Kodi raises a busy dialog while opening a stream and holds it until the
+ * player starts, which for a live stream means until the first packet of
+ * every declared track arrives. A client offered a session that then delivers
+ * nothing -- the sender moved on, or was stopped between the offer and the
+ * open -- leaves that dialog on screen with no way back: the player cannot
+ * start, so nothing closes it, and the spinner outlives the session.
+ */
+static uint64_t g_client_since_ns;
+static bool g_client_got_media;
+
+/* How long a client may go from connecting to being sent anything at all. */
+#define APX_CLIENT_NOSTART_NS (10ull * 1000000000ull)
+
+/*
  * A sender can negotiate an audio session and then send nothing at all -- it
  * has picked the receiver but is not playing. Kodi opens the stream and sits
  * there with the clock running on an empty stream, which looks exactly like
@@ -624,6 +641,8 @@ static void out_clear_locked(void)
 static void reset_client_state_locked(void)
 {
   g_client_connected = false;
+  g_client_since_ns = 0;
+  g_client_got_media = false;
   g_sent_streaminfo = false;
   g_sent_params = false;
   g_primed = false;
@@ -708,6 +727,8 @@ static bool send_msg_locked(
 
   out_push_locked(msg);
   pthread_mutex_unlock(&g_out_lock);
+  if (type == APX_MSG_VIDEO || type == APX_MSG_AUDIO)
+    g_client_got_media = true;
   return true;
 }
 
@@ -2752,6 +2773,8 @@ static void* accept_thread(void* arg)
     pthread_mutex_unlock(&g_out_lock);
 
     g_client_connected = true;
+    g_client_since_ns = now_ns();
+    g_client_got_media = false;
     g_have_base = false; /* timeline restarts from the priming keyframe */
     g_last_audio_ns = 0;
     LOGI("client connected");
@@ -3215,6 +3238,26 @@ int main(int argc, char** argv)
       LOGI("nothing from the sender for %llu seconds, ending the session",
            (unsigned long long)((now - last_contact) / 1000000000ull));
       end_session_maybe(mode_now);
+      continue;
+    }
+
+    /*
+     * Offered a session and sent nothing. Whatever the add-on was opened for
+     * is not coming, so end its stream: Kodi closes the player, and the busy
+     * dialog waiting on a start that cannot happen goes with it. The session
+     * itself is left alone -- the sender may still be there, and playback is
+     * offered again as soon as anything arrives to play.
+     */
+    const bool client_nostart = g_client_connected && !g_client_got_media && g_client_since_ns &&
+                                now - g_client_since_ns > APX_CLIENT_NOSTART_NS;
+    if (client_nostart)
+    {
+      LOGI("nothing to send the add-on %llu seconds after it connected, ending its stream",
+           (unsigned long long)((now - g_client_since_ns) / 1000000000ull));
+      g_client_since_ns = 0;
+      end_client_stream_locked();
+      pthread_mutex_unlock(&g_lock);
+      emit_event("STOP");
       continue;
     }
 
