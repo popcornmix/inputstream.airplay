@@ -430,6 +430,55 @@ PLAYING = {'url': ''}
 PENDING_AUDIO = {'due': 0.0}
 AUDIO_START_GRACE = 3.0
 
+# A track change arrives as a title and its artwork in separate events, and the
+# sender sends a placeholder title a moment before the real one. Holding the
+# push briefly coalesces all of that into one update, so the placeholder is
+# usually overwritten before anything is shown.
+PENDING_INFO = {'due': 0.0}
+INFO_PUSH_GRACE = 0.3
+
+# getCurrentWindowDialogId() reports this when no modal dialog is up.
+WINDOW_INVALID = 9999
+
+# How long to leave a dialog before looking again, for the work held back
+# while one is open.
+DIALOG_RETRY_GRACE = 0.5
+
+
+# When a dialog was last seen. Kodi drops a dialog from its active list before
+# the render loop that dialog was driving has unwound, so "no dialog" is not
+# yet "safe" -- a stop landing in that gap is run from the loop all the same.
+DIALOG_LAST_SEEN = {'at': 0.0}
+DIALOG_SETTLE = 1.0
+
+
+def dialog_open():
+    """True while a modal dialog is up, closing ones included.
+
+    GetTopmostModalDialog() counts a dialog that is animating closed, which is
+    wanted here: it is still driving the render loop at that point.
+    """
+    try:
+        found = xbmcgui.getCurrentWindowDialogId() != WINDOW_INVALID
+    except Exception:
+        # Not worth failing a stop over; treat an unknown GUI state as clear.
+        return False
+    if found:
+        DIALOG_LAST_SEEN['at'] = time.time()
+    return found
+
+
+def dialog_blocking():
+    """True while it is unsafe to make Kodi tear a player down.
+
+    What this guards is described at PENDING_STOP. The settle period is what
+    covers the gap after a dialog closes, which is where this deadlocked when
+    only the dialog itself was checked for.
+    """
+    if dialog_open():
+        return True
+    return time.time() - DIALOG_LAST_SEEN['at'] < DIALOG_SETTLE
+
 
 def build_item():
     item = xbmcgui.ListItem(TRACK['title'] or 'AirPlay')
@@ -452,6 +501,52 @@ def build_item():
     return item
 
 
+def info_item():
+    """The details that can change without the stream changing.
+
+    Carries the path deliberately: the update is applied only where it matches
+    what is playing, so an item without one is dropped in silence rather than
+    refused. No info tag, for the reason build_item() gives -- none is needed,
+    because the fields below are merged into the item Kodi already has.
+
+    Artwork is always set, empty included, so that a track without any clears
+    the last one instead of inheriting it.
+    """
+    item = xbmcgui.ListItem(TRACK['title'] or 'AirPlay', path=PLAYING['url'])
+    item.setLabel2(TRACK['artist'])
+    item.setArt({'thumb': TRACK['art'], 'fanart': TRACK['art']})
+    return item
+
+
+def service_pending_info():
+    """Show the track details the sender has reported since playback started.
+
+    Runs on the service thread, where the Kodi API is safe, but that alone is
+    not enough: updateInfoTag() sends its GUI message synchronously and
+    deadlocks if it lands while playback is being torn down. The echo guard is
+    set around every stop this add-on makes, so waiting it out is what keeps
+    this off that path -- the push is held rather than dropped, since a track
+    change that arrives during a stop is still worth showing afterwards.
+    """
+    due = PENDING_INFO['due']
+    if not due or time.time() < due:
+        return
+    if echoing():
+        return
+    PENDING_INFO['due'] = 0.0
+    if not PLAYING['url']:
+        return
+    player = xbmc.Player()
+    try:
+        if not player.isPlaying() or player.getPlayingFile() != PLAYING['url']:
+            return
+        player.updateInfoTag(info_item())
+    except RuntimeError:
+        # Stopped between the check and the call, which is exactly the race the
+        # guard above cannot close on its own.
+        return
+
+
 def start_playback():
     player = xbmc.Player()
 
@@ -467,6 +562,16 @@ def start_playback():
                 return
         except RuntimeError:
             pass  # it stopped between the two calls; carry on and open it
+
+    # Opening carries the same hazard as stopping: Kodi replaces a running
+    # stream by stopping it first, on the main thread, and a modal dialog runs
+    # that from inside its own render loop. See PENDING_STOP. Come back for it
+    # rather than risk the deadlock -- there is nothing to gain by starting a
+    # session on top of an error the user has not dismissed yet.
+    if dialog_blocking():
+        PENDING_AUDIO['due'] = time.time() + DIALOG_RETRY_GRACE
+        log('a dialog is open, holding the session start until it closes', xbmc.LOGDEBUG)
+        return
 
     log('session started, opening player')
 
@@ -487,12 +592,31 @@ def start_playback():
     player.play(STREAM_URL, build_item())
 
 
+# A video handoff held back while a dialog is open, and when to give up on it.
+PENDING_HLS = {'url': '', 'start': 0.0, 'due': 0.0, 'expires': 0.0}
+
+
 def start_hls(url, start_position):
     """Play a playlist the sender nominated.
 
     This is ordinary HLS, so it bypasses inputstream.airplay entirely and lets
     Kodi demux and decode it the way it would any other stream.
     """
+    # See PENDING_STOP. player.play() has Kodi stop whatever is playing first,
+    # on the main thread, so it is as dangerous as a stop while a dialog is
+    # driving the render loop. This is also the path a DRM failure arrives on
+    # -- inputstream.adaptive raises its dialog from the OpenStream below --
+    # which makes a second handoff, offered while the first one's dialog is
+    # still up, the way this deadlocks in practice.
+    if dialog_blocking():
+        if not PENDING_HLS['due']:
+            PENDING_HLS['expires'] = time.time() + STOP_DEFER_LIMIT
+            log('a dialog is open, holding the video handoff until it closes')
+        PENDING_HLS.update(url=url, start=start_position,
+                           due=time.time() + DIALOG_RETRY_GRACE)
+        return
+    PENDING_HLS['due'] = 0.0
+
     item = xbmcgui.ListItem(TRACK['title'] or 'AirPlay')
     # No mime type here. Kodi turns one into a "?mimetype=..." URL option, and
     # the playlist server in the AirPlay library matches request paths exactly,
@@ -530,19 +654,71 @@ def start_hls(url, start_position):
     player.play(url, item)
 
 
+# A stop that could not be issued yet, and how long to keep trying.
+#
+# Kodi runs an add-on's stop from the render loop, and a modal dialog pumps
+# that loop itself -- so a stop delivered while one is open is run inside it.
+# If the dialog belongs to the player being stopped, the two wait on each
+# other: the main thread blocks joining the player thread, and the player
+# thread is blocked waiting for the main thread to show its dialog. That is
+# reachable in practice, because inputstream.adaptive raises a modal dialog
+# from OpenStream when it cannot set up a decryptor, and an AirPlay session
+# ending at that moment is exactly when a stop arrives. Holding the stop until
+# the dialog closes keeps us off that path; issuing it asynchronously would
+# not, since the main thread would still run it from inside the dialog.
+PENDING_STOP = {'wanted': False, 'expires': 0.0}
+STOP_DEFER_LIMIT = 30.0
+
+
 def stop_playback():
     player = xbmc.Player()
     if not player.isPlaying():
+        PENDING_STOP['wanted'] = False
         return
     try:
         current = player.getPlayingFile()
     except RuntimeError:
+        PENDING_STOP['wanted'] = False
         return
     if current and current == PLAYING['url']:
+        if dialog_blocking():
+            if not PENDING_STOP['wanted']:
+                PENDING_STOP.update(wanted=True, expires=time.time() + STOP_DEFER_LIMIT)
+                log('a dialog is open, holding the stop until it closes')
+            return
         log('session ended, stopping player')
         guard_echo()
         player.stop()
+    PENDING_STOP['wanted'] = False
     PLAYING['url'] = ''
+
+
+def service_pending_hls():
+    """Start a video handoff that was held back, once the dialog has gone."""
+    due = PENDING_HLS['due']
+    if not due or time.time() < due:
+        return
+    if time.time() >= PENDING_HLS['expires']:
+        PENDING_HLS['due'] = 0.0
+        log('dialog still open, abandoning the video handoff', xbmc.LOGWARNING)
+        return
+    start_hls(PENDING_HLS['url'], PENDING_HLS['start'])
+
+
+def service_pending_stop():
+    """Issue a stop that was held back, once the dialog blocking it has gone."""
+    if not PENDING_STOP['wanted']:
+        return
+    if dialog_blocking():
+        if time.time() < PENDING_STOP['expires']:
+            return
+        # Give up rather than force it: whatever is on screen has been there
+        # long enough to be someone reading it, and the deadlock this avoids
+        # takes Kodi out completely.
+        PENDING_STOP['wanted'] = False
+        log('dialog still open, abandoning the stop', xbmc.LOGWARNING)
+        return
+    stop_playback()
 
 
 # The sender's own remote control. Kodi is only rendering a stream, so pausing
@@ -748,6 +924,10 @@ def handle_event(line):
             start_playback()
     elif line == 'EVENT STOP':
         PENDING_AUDIO['due'] = 0.0
+        # Nothing left to describe, and the stop below is exactly what a push
+        # must not race.
+        PENDING_INFO['due'] = 0.0
+        PENDING_HLS['due'] = 0.0
         TRACK.update(title='', artist='', album='', art='')
         DACP.update(id='', token='', host='', port='', retry_at=0.0)
         stop_playback()
@@ -764,10 +944,7 @@ def handle_event(line):
         if [TRACK['title'], TRACK['artist'], TRACK['album']] == fields[:3]:
             return
         TRACK.update(title=fields[0], artist=fields[1], album=fields[2])
-        # Only recorded, not pushed to the player. Player.updateInfoTag()
-        # issues a synchronous GUI message that deadlocks against playback
-        # being torn down, so details are attached when playback starts and
-        # mid-session changes are not shown.
+        PENDING_INFO['due'] = time.time() + INFO_PUSH_GRACE
         log('now playing: {} - {}'.format(TRACK['artist'], TRACK['title']))
     elif line.startswith('EVENT PIN '):
         pin = line[10:]
@@ -786,10 +963,12 @@ def handle_event(line):
         # up against whatever is playing now. The reader strips the line, so an
         # empty argument arrives as a bare event.
         TRACK['art'] = ''
+        PENDING_INFO['due'] = time.time() + INFO_PUSH_GRACE
     elif line.startswith('EVENT ART '):
         if TRACK['art'] == line[10:]:
             return
         TRACK['art'] = line[10:]
+        PENDING_INFO['due'] = time.time() + INFO_PUSH_GRACE
     elif line.startswith('EVENT HLS '):
         PENDING_AUDIO['due'] = 0.0  # this is a video session after all
         payload = line[10:].split(' ')
@@ -951,6 +1130,9 @@ def main():
 
         drain_events()
         service_pending_audio()
+        service_pending_info()
+        service_pending_hls()
+        service_pending_stop()
 
         # waitForAbort specifically, because it is also what lets Kodi deliver
         # this add-on's monitor callbacks -- replacing it with an event of our
