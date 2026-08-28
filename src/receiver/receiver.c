@@ -1422,6 +1422,7 @@ static void end_client_stream_locked(void)
   g_last_audio_ns = 0;
   g_audio_session_ns = 0;
   g_audio_session_frames = 0;
+  g_audio_is_music = false;
   memset(&g_info, 0, sizeof(g_info));
   g_info.sample_rate = 44100;
   g_info.channels = 2;
@@ -2575,7 +2576,15 @@ static void cb_on_video_acquire_playback_info(void* cls, playback_info_t* info)
   if (video_ended)
   {
     g_session.notify_video_ended = false;
-    session_set_mode_locked(MODE_IDLE);
+    /*
+     * The sender still has to be told its video finished, but only take the
+     * session down if the video is still what it is. Mirroring sets this flag
+     * on its way in, precisely because it replaced a video -- and the polls
+     * arrive every few hundred milliseconds, so without this the mirroring
+     * session that set it was dropped to idle immediately after starting.
+     */
+    if (g_session.mode == MODE_VIDEO)
+      session_set_mode_locked(MODE_IDLE);
   }
   const session_mode_t mode = g_session.mode;
   const uint64_t video_start_ns = g_video_start_ns;
