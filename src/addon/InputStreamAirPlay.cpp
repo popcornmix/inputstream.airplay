@@ -33,6 +33,10 @@ constexpr int READ_POLL_MS = 100;
 
 /* Give the receiver time to report the session format when we attach. */
 constexpr int STREAMINFO_TIMEOUT_MS = 10000;
+
+/* Longer than any gap between audio frames, short enough that a pause is
+ * spotted on the first frame back. Frames arrive a few milliseconds apart. */
+constexpr unsigned int PAUSE_GAP_MS = 500;
 } // namespace
 
 CInputStreamAirPlay::CInputStreamAirPlay(const kodi::addon::IInstanceInfo& instance)
@@ -456,7 +460,23 @@ DEMUX_PACKET* CInputStreamAirPlay::DemuxRead()
   /* How far the audio has got, used to carry the reported track position
    * forward between the sender's updates. */
   if (hdr.type == APX_MSG_AUDIO)
-    m_lastAudioMs = static_cast<unsigned int>(hdr.pts_ns / 1000000ull);
+  {
+    const unsigned int ms = static_cast<unsigned int>(hdr.pts_ns / 1000000ull);
+    const unsigned int previous = m_lastAudioMs.exchange(ms);
+
+    /*
+     * A pause stops the audio but not the clock the timestamps are taken
+     * from, so the first frame back carries the whole pause in its timestamp
+     * while the track has not moved at all. Carry the anchor across the gap,
+     * or the elapsed time jumps by the length of the pause and stays there
+     * until the sender's next progress report pulls it back.
+     *
+     * Only a gap far longer than the few milliseconds between frames counts,
+     * so ordinary jitter is left alone.
+     */
+    if (previous && ms > previous + PAUSE_GAP_MS)
+      m_positionAnchorMs += ms - previous;
+  }
 
   return pkt;
 }
