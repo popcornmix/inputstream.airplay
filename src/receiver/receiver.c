@@ -1405,15 +1405,23 @@ static void cb_conn_init(void* cls)
 
 /*
  * Tell the add-on the stream it is reading has finished, and forget everything
- * describing it, so the next one starts from scratch. Kodi closes the player
- * on the end of stream; without one it sits in the caching state it opened in,
- * waiting for data that has stopped coming, and the busy dialog it raised to
- * do that stays on screen.
+ * describing it, so the next one starts from scratch. Kodi usually closes the
+ * player on the end of stream; without one it sits in the caching state it
+ * opened in, waiting for data that has stopped coming, and the busy dialog it
+ * raised to do that stays on screen.
  */
 static void end_client_stream_locked(void)
 {
   send_msg_locked(APX_MSG_EOS, 0, 0, NULL, 0);
-  g_have_base = false;
+  /*
+   * The timestamp base deliberately survives. The end of stream does not
+   * reliably close the player: Kodi keeps reading while either of its players
+   * still holds data, so a session starting soon after one ends is served
+   * into the same player, whose clock has been running the whole time.
+   * Restarting the timeline under it put the new stream seconds behind that
+   * clock, and nothing was rendered. It is reset when a client connects,
+   * which is the point at which there really is a new player and a new clock.
+   */
   g_params_len = 0;
   gop_clear();
   g_primed = false;
