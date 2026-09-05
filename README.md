@@ -37,6 +37,14 @@ input, and a fault there stops a helper rather than taking Kodi down.
 
 ## Behaviour worth knowing
 
+Kodi's own AirPlay receiver cannot run alongside this one. The ports do not
+clash -- Kodi listens on 36666 and 36667, the daemon on 7000 -- but both
+advertise `_airplay._tcp` with the `deviceid` taken from the same interface
+MAC, so a sender cannot tell them apart and may reach Kodi's, which does not
+mirror. So if **Settings / Services / AirPlay** is on when this add-on starts,
+it offers to turn it off, and remembers a refusal rather than asking again.
+Turning Kodi's receiver off and back on later asks afresh.
+
 A second sender takes the session from the first, the way an Apple TV does.
 UxPlay defaults to the opposite -- holding the session and turning newcomers
 away, with `-nohold` to opt in -- so if you have come from there, expect this

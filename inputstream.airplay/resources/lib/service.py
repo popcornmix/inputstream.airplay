@@ -174,19 +174,83 @@ def use_inprocess_rpc():
             'off' if inproc else 'on', 'in-process' if inproc else 'over the loopback socket'))
 
 
-def warn_about_core_airplay():
-    """Say something if Kodi's own AirPlay receiver is also running.
+# Set while the dialog below is up, so the poll does not raise a second one.
+ASKING_ABOUT_CORE_AIRPLAY = threading.Event()
 
-    Both advertise under the same device name, so the sender shows two
-    identical targets and picking the wrong one does nothing recognisable.
-    Nothing here can turn it off -- that is the user's call -- but an
-    unexplained duplicate is worth a line in the log.
+# The remembered answer, mirrored here because reading an add-on setting means
+# constructing an Addon, which re-reads every setting and logs a complaint
+# about the empty password default each time. Once a poll is once every ten
+# seconds, that is a log full of it.
+KEEP_CORE_AIRPLAY = [None]
+
+
+def remember_core_airplay_answer(keep):
+    KEEP_CORE_AIRPLAY[0] = keep
+    xbmcaddon.Addon().setSettingBool('keepcoreairplay', keep)
+
+
+def ensure_core_airplay_off():
+    """Offer to turn off Kodi's own AirPlay receiver, which this one clashes with.
+
+    Not a port clash -- Kodi listens on 36666 and 36667, the daemon on 7000 --
+    but an mDNS one. Both publish _airplay._tcp with the deviceid taken from
+    the same interface MAC, so a sender cannot tell the two apart and the one
+    it picks may be Kodi's, which does not mirror. Renaming does not separate
+    them; only one of the two can be advertised.
+
+    Kodi's is the one to drop, and asking is the least presumptuous way to
+    drop it: turning services.airplay off is a visible change to a setting
+    this add-on does not own, and someone may be running Kodi's receiver
+    deliberately. The answer is remembered so a refusal is not asked again,
+    and forgotten once Kodi's receiver is off, so turning it back on asks
+    afresh rather than silently reinstating a decision made months ago.
+
+    Writing the setting stops the AirTunes and AirPlay servers and withdraws
+    both records as it returns, so nothing needs restarting afterwards.
     """
-    for name, what in (('services.airplay', 'AirPlay'), ('services.airtunes', 'AirTunes')):
-        if kodi_setting(name) is True:
-            log("Kodi's own {} receiver is enabled as well as this add-on; the sender "
-                'will show two devices with the same name. Turn it off under '
-                'Settings / Services / AirPlay.'.format(what), xbmc.LOGWARNING)
+    if KEEP_CORE_AIRPLAY[0] is None:
+        KEEP_CORE_AIRPLAY[0] = setting_bool('keepcoreairplay')
+
+    if kodi_setting('services.airplay') is not True:
+        if KEEP_CORE_AIRPLAY[0]:
+            remember_core_airplay_answer(False)
+        return
+
+    if KEEP_CORE_AIRPLAY[0] or ASKING_ABOUT_CORE_AIRPLAY.is_set():
+        return
+
+    # Nothing to put a modal in front of: a session in progress, or another
+    # dialog. Asked again on the next poll.
+    if PLAYING['url'] or dialog_open():
+        return
+
+    # On a thread of its own: the dialog blocks until it is answered, and the
+    # loop that calls this is what starts playback when a sender connects.
+    ASKING_ABOUT_CORE_AIRPLAY.set()
+    threading.Thread(target=ask_about_core_airplay, daemon=True).start()
+
+
+def ask_about_core_airplay():
+    try:
+        if not xbmcgui.Dialog().yesno(ADDON.getAddonInfo('name'),
+                                      ADDON.getLocalizedString(30024),
+                                      nolabel=ADDON.getLocalizedString(30025),
+                                      yeslabel=ADDON.getLocalizedString(30026)):
+            remember_core_airplay_answer(True)
+            log("Kodi's own AirPlay receiver was left enabled; a sender will show "
+                'two devices with the same name, and mirroring may reach the wrong '
+                'one.', xbmc.LOGWARNING)
+            return
+
+        reply = kodi_rpc('Settings.SetSettingValue',
+                         {'setting': 'services.airplay', 'value': False})
+        if (reply or {}).get('result') is True:
+            log("turned off Kodi's own AirPlay receiver")
+        else:
+            log("could not turn off Kodi's own AirPlay receiver; turn it off under "
+                'Settings / Services / AirPlay.', xbmc.LOGWARNING)
+    finally:
+        ASKING_ABOUT_CORE_AIRPLAY.clear()
 
 
 def active_player_id():
@@ -1047,15 +1111,22 @@ class AirPlayMonitor(xbmc.Monitor):
         self.restart_wanted = False
 
     def onSettingsChanged(self):
-        # Fires for any settings change, not just this add-on's, which is
-        # exactly what makes it the right place to re-read Kodi's own.
-        use_inprocess_rpc()
+        # Only this add-on's settings reach here: Kodi dispatches the callback
+        # to the monitor whose add-on id matches the one that was saved.
+        # Kodi's own settings are polled instead; see KODI_SETTING_POLL.
         current = receiver_settings()
         if current != self.settings:
             self.settings = current
             self.restart_wanted = True
             log('settings changed, restarting receiver')
 
+
+# How often to re-read the settings of Kodi's own that this add-on depends on.
+# Polled because there is no callback for them: onSettingsChanged only fires
+# for an add-on's own settings, so remote control being turned off, or Kodi's
+# AirPlay receiver being turned on, is otherwise never noticed. The first poll
+# is one interval in, which also keeps the dialog below off a booting screen.
+KODI_SETTING_POLL = 10.0
 
 # How long to wait before restarting a daemon that keeps exiting, and how long
 # it has to stay up before it counts as healthy again.
@@ -1067,7 +1138,6 @@ RESTART_STABLE_AFTER = 30.0
 def main():
     monitor = AirPlayMonitor()
     use_inprocess_rpc()
-    warn_about_core_airplay()
     # Held for the life of the service: a Player that goes out of scope stops
     # receiving callbacks.
     player = AirPlayPlayer()
@@ -1077,8 +1147,14 @@ def main():
     backoff = 0.0
     retry_at = 0.0
     started_at = 0.0
+    poll_at = time.time() + KODI_SETTING_POLL
 
     while not monitor.abortRequested():
+        if time.time() >= poll_at:
+            poll_at = time.time() + KODI_SETTING_POLL
+            use_inprocess_rpc()
+            ensure_core_airplay_off()
+
         if monitor.restart_wanted and process is not None and process.poll() is None:
             monitor.restart_wanted = False
             # Asked for, not a failure: the backoff exists to slow down a

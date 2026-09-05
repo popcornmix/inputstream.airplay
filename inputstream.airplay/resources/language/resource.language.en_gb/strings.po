@@ -107,3 +107,15 @@ msgstr ""
 msgctxt "#30023"
 msgid "Could not forget paired devices"
 msgstr ""
+
+msgctxt "#30024"
+msgid "Kodi's own AirPlay receiver is switched on as well. Your phone will see two devices with the same name, and the one it picks may be Kodi's, which cannot mirror. Turn Kodi's own receiver off?"
+msgstr ""
+
+msgctxt "#30025"
+msgid "Leave it on"
+msgstr ""
+
+msgctxt "#30026"
+msgid "Turn it off"
+msgstr ""

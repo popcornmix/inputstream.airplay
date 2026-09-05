@@ -61,6 +61,12 @@
             <close>false</close>
           </control>
         </setting>
+        <setting id="keepcoreairplay" type="boolean">
+          <level>0</level>
+          <default>false</default>
+          <visible>false</visible>
+          <control type="toggle"/>
+        </setting>
         <setting id="debuglog" type="boolean" label="30020" help="30021">
           <level>2</level>
           <default>false</default>
